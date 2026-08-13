@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  install.sh — one-shot installer for the Previs Pexip Video Client
+# =============================================================================
+#
+#  Run as root (or with sudo) on a freshly flashed Raspberry Pi running
+#  Ubuntu Server 22.04 or 24.04 (64-bit / ARM64):
+#
+#      sudo bash install.sh
+#
+#  What this script does:
+#    1. Installs OS build dependencies and audio/video packages.
+#    2. Downloads and installs the Pexip Pulse SDK from the doppler repository.
+#    3. Builds the previs-client binary with CMake.
+#    4. Installs the binary, config file, and systemd service.
+#    5. Creates a dedicated 'previs' system user.
+#    6. Enables and starts the systemd service.
+#
+#  After installation, edit the configuration file and restart:
+#
+#      sudo nano /etc/previs-client/config.yaml
+#      sudo systemctl restart previs-client
+#
+# =============================================================================
+
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DOPPLER_REPO="https://github.com/pexip/doppler.git"
+DOPPLER_DIR="/tmp/doppler-sdk"
+BUILD_DIR="/tmp/previs-client-build"
+INSTALL_PREFIX="/usr/local"
+SDK_PREFIX="/opt/pexip"
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+
+info()    { echo -e "${GREEN}[install]${NC} $*"; }
+warning() { echo -e "${YELLOW}[install]${NC} $*"; }
+error()   { echo -e "${RED}[install]${NC} $*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# 0. Privilege check
+# ---------------------------------------------------------------------------
+if [[ $EUID -ne 0 ]]; then
+    error "Please run as root: sudo bash install.sh"
+fi
+
+# ---------------------------------------------------------------------------
+# 1. OS dependencies
+# ---------------------------------------------------------------------------
+info "Updating package lists..."
+apt-get update -y
+
+info "Installing build tools and audio/video packages..."
+apt-get install -y \
+    build-essential cmake git \
+    libyaml-cpp-dev \
+    libglfw3-dev libgl1-mesa-dev \
+    pulseaudio alsa-utils \
+    v4l-utils \
+    network-manager
+
+# ---------------------------------------------------------------------------
+# 2. Pexip Pulse SDK (.deb packages from the doppler repo)
+# ---------------------------------------------------------------------------
+if [[ -f "${SDK_PREFIX}/include/pexpulse/pulse.h" ]]; then
+    info "Pulse SDK already installed at ${SDK_PREFIX} — skipping."
+else
+    info "Cloning doppler repository to get the Pulse SDK..."
+    rm -rf "${DOPPLER_DIR}"
+    git clone --depth 1 "${DOPPLER_REPO}" "${DOPPLER_DIR}"
+
+    SDK_DEBS="${DOPPLER_DIR}/sdk/linux/debs"
+    if [[ ! -d "${SDK_DEBS}" ]]; then
+        error "Could not find sdk/linux/debs in the doppler repository. " \
+              "Check that the repo structure matches what is expected."
+    fi
+
+    info "Installing Pulse SDK .deb packages..."
+    dpkg -i "${SDK_DEBS}"/libpexcommon_*.deb \
+            "${SDK_DEBS}"/libpexpulse_*.deb   \
+            "${SDK_DEBS}"/libpexpulse-dev_*.deb || true
+    apt-get install -f -y   # resolve any missing dependencies
+
+    rm -rf "${DOPPLER_DIR}"
+    info "Pulse SDK installed."
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Build
+# ---------------------------------------------------------------------------
+info "Building previs-client..."
+rm -rf "${BUILD_DIR}"
+cmake -S "${REPO_DIR}" -B "${BUILD_DIR}" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}" \
+    -DPEXIP_PREFIX="${SDK_PREFIX}"
+
+cmake --build "${BUILD_DIR}" -j"$(nproc)"
+
+# ---------------------------------------------------------------------------
+# 4. Install binary and systemd service
+# ---------------------------------------------------------------------------
+info "Installing previs-client binary..."
+install -m 755 "${BUILD_DIR}/previs-client" "${INSTALL_PREFIX}/bin/previs-client"
+
+info "Installing config file..."
+mkdir -p /etc/previs-client
+if [[ -f /etc/previs-client/config.yaml ]]; then
+    warning "/etc/previs-client/config.yaml already exists — not overwriting."
+    warning "Your current config is preserved. New template saved as config.yaml.new"
+    install -m 644 "${REPO_DIR}/config.yaml" /etc/previs-client/config.yaml.new
+else
+    install -m 644 "${REPO_DIR}/config.yaml" /etc/previs-client/config.yaml
+fi
+
+info "Installing systemd service..."
+install -m 644 "${REPO_DIR}/systemd/previs-client.service" \
+    /etc/systemd/system/previs-client.service
+
+# ---------------------------------------------------------------------------
+# 5. System user
+# ---------------------------------------------------------------------------
+if ! id -u previs &>/dev/null; then
+    info "Creating system user 'previs'..."
+    useradd -r -s /usr/sbin/nologin -G audio,video -c "Previs video client" previs
+else
+    info "System user 'previs' already exists."
+    # Ensure group memberships.
+    usermod -aG audio,video previs 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Enable and start the service
+# ---------------------------------------------------------------------------
+info "Reloading systemd daemon..."
+systemctl daemon-reload
+
+info "Enabling previs-client service (starts on boot)..."
+systemctl enable previs-client
+
+info "Starting previs-client service..."
+systemctl restart previs-client
+
+# ---------------------------------------------------------------------------
+# Done
+# ---------------------------------------------------------------------------
+echo ""
+info "Installation complete!"
+echo ""
+echo "  Configuration file : /etc/previs-client/config.yaml"
+echo "  Service status     : sudo systemctl status previs-client"
+echo "  Live logs          : sudo journalctl -fu previs-client"
+echo ""
+warning "IMPORTANT: Edit /etc/previs-client/config.yaml to set your"
+warning "           Pexip server, VMR and display name, then restart:"
+echo ""
+echo "      sudo nano /etc/previs-client/config.yaml"
+echo "      sudo systemctl restart previs-client"
+echo ""

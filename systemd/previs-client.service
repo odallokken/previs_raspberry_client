@@ -1,0 +1,29 @@
+[Unit]
+Description=Previs Pexip Video Client
+Documentation=https://github.com/odallokken/previs_raspberry_client
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=previs
+Group=previs
+
+# Path to the Pexip Pulse runtime and its private siblings.
+Environment="PEX_BASE_PATH=/opt/pexip"
+Environment="LD_LIBRARY_PATH=/opt/pexip/lib"
+
+ExecStart=/usr/local/bin/previs-client /etc/previs-client/config.yaml
+
+# Restart automatically if the process exits unexpectedly.
+Restart=on-failure
+RestartSec=10s
+
+# Give Pulse enough time to shut down gracefully on SIGTERM before SIGKILL.
+TimeoutStopSec=15s
+
+# Allow access to audio/video devices.
+SupplementaryGroups=audio video render
+
+[Install]
+WantedBy=multi-user.target
