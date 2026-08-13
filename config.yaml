@@ -1,0 +1,30 @@
+# =============================================================================
+# Previs Raspberry Client — Configuration
+# =============================================================================
+# Edit this file to point the client at your Pexip Infinity deployment.
+# After editing, restart the service:
+#
+#   sudo systemctl restart previs-client
+#
+# Keys
+# ----
+# server        Hostname (or IP) of your Pexip Infinity Conferencing Node
+#               e.g. "vc.example.com" or "192.168.1.100"
+#
+# vmr           The Virtual Meeting Room alias to dial into
+#               e.g. "meet.boardroom" or "vmr@vc.example.com"
+#
+# display_name  The name that appears for this device in the participant list
+#
+# pin           Host or guest PIN for the VMR (leave empty if none required)
+#
+# reconnect_delay_seconds
+#               How long to wait before retrying after a call drops.
+#               Minimum 5 seconds.
+# =============================================================================
+
+server: "vc.example.com"
+vmr: "meet.boardroom"
+display_name: "Raspberry Pi Client"
+pin: ""
+reconnect_delay_seconds: 10
