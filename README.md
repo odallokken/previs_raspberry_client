@@ -251,4 +251,5 @@ previs_raspberry_client/
 | No audio | `aplay -l` to list playback devices; `arecord -l` to list capture devices |
 | Cannot reach server | `ping <server>` — check network and firewall rules (Pexip uses TCP 443 and UDP 3478/3479) |
 | Wrong PIN | Edit `/etc/previs-client/config.yaml` and restart the service |
+| `dpkg-dev : Depends: bzip2 but it is not installable` during install | The image has an incomplete apt configuration (the `-updates` pocket and/or the `universe` component is missing). The installer now enables them automatically; if it still fails, check `/etc/apt/sources.list` and `/etc/apt/sources.list.d/`, then run `sudo apt-get update && sudo apt-get -f install` |
 | SDK packages not found | Check that `sdk/linux/debs/*.deb` exist in the doppler repository clone |
