@@ -6,7 +6,7 @@
 #  Run as root (or with sudo) on a freshly flashed Raspberry Pi running
 #  Ubuntu Server 22.04 or 24.04 (64-bit / ARM64):
 #
-#      sudo bash install.sh
+#      sudo bash scripts/install.sh
 #
 #  What this script does:
 #    1. Installs OS build dependencies and audio/video packages.
@@ -25,7 +25,9 @@
 
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The script lives in <repo>/scripts, so the repository root is one level up.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DOPPLER_REPO="https://github.com/pexip/doppler.git"
 DOPPLER_DIR="/tmp/doppler-sdk"
 BUILD_DIR="/tmp/previs-client-build"
@@ -42,7 +44,7 @@ error()   { echo -e "${RED}[install]${NC} $*" >&2; exit 1; }
 # 0. Privilege check
 # ---------------------------------------------------------------------------
 if [[ $EUID -ne 0 ]]; then
-    error "Please run as root: sudo bash install.sh"
+    error "Please run as root: sudo bash scripts/install.sh"
 fi
 
 # ---------------------------------------------------------------------------
@@ -140,10 +142,50 @@ else
     fi
 
     info "Installing Pulse SDK .deb packages..."
-    dpkg -i "${SDK_DEBS}"/libpexcommon_*.deb \
-            "${SDK_DEBS}"/libpexpulse_*.deb   \
-            "${SDK_DEBS}"/libpexpulse-dev_*.deb || true
+    DPKG_ARCH="$(dpkg --print-architecture)"
+
+    # The doppler repository ships packages for several architectures; pick the
+    # ones that match this machine (a Raspberry Pi running 64-bit Ubuntu is
+    # 'arm64').  Installing an 'amd64' package on arm64 fails with
+    # "package architecture (amd64) does not match system (arm64)".
+    find_deb() {
+        local pkg="$1" deb
+        for deb in "${SDK_DEBS}/${pkg}"_*_"${DPKG_ARCH}".deb \
+                   "${SDK_DEBS}/${pkg}"_*_all.deb; do
+            [[ -f "${deb}" ]] || continue
+            printf '%s\n' "${deb}"
+            return 0
+        done
+        return 1
+    }
+
+    SDK_PACKAGES=()
+    MISSING_PACKAGES=()
+    for pkg in libpexcommon libpexpulse libpexpulse-dev; do
+        if deb="$(find_deb "${pkg}")"; then
+            SDK_PACKAGES+=("${deb}")
+        else
+            MISSING_PACKAGES+=("${pkg}")
+        fi
+    done
+
+    if (( ${#MISSING_PACKAGES[@]} )); then
+        AVAILABLE="$(ls "${SDK_DEBS}" 2>/dev/null | tr '\n' ' ')"
+        error "The Pulse SDK does not provide '${DPKG_ARCH}' packages for:" \
+              "${MISSING_PACKAGES[*]}." \
+              "Available files in ${SDK_DEBS}: ${AVAILABLE:-<none>}." \
+              "The Pexip Pulse SDK must be built or obtained for ${DPKG_ARCH}" \
+              "before this client can be installed on this machine."
+    fi
+
+    dpkg -i "${SDK_PACKAGES[@]}" || true
     apt-get install -f -y   # resolve any missing dependencies
+
+    if [[ ! -f "${SDK_PREFIX}/include/pexpulse/pulse.h" ]]; then
+        error "The Pulse SDK packages did not install correctly —" \
+              "${SDK_PREFIX}/include/pexpulse/pulse.h is missing." \
+              "Check the dpkg output above for errors."
+    fi
 
     rm -rf "${DOPPLER_DIR}"
     info "Pulse SDK installed."
