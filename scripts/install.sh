@@ -48,17 +48,80 @@ fi
 # ---------------------------------------------------------------------------
 # 1. OS dependencies
 # ---------------------------------------------------------------------------
+
+# Some Raspberry Pi images ship with an incomplete apt configuration: only the
+# release and '-security' pockets are enabled, and/or the 'universe' component
+# is missing.  That combination breaks dependency resolution for packages that
+# received a security update (a typical symptom is
+# "dpkg-dev : Depends: bzip2 but it is not installable"), because the updated
+# library is installed while the matching tool is only available in the
+# '-updates' pocket that is not configured.  Enable the missing pockets and
+# components before installing anything.
+ensure_apt_sources() {
+    local codename="" changed=0
+    if [[ -r /etc/os-release ]]; then
+        codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-}")"
+    fi
+    [[ -n "${codename}" ]] || { warning "Could not detect the Ubuntu codename — skipping apt source check."; return 0; }
+
+    local f
+    # deb822 style sources (Ubuntu 24.04 and newer).
+    for f in /etc/apt/sources.list.d/*.sources; do
+        [[ -f "${f}" ]] || continue
+        grep -qE "^Suites:.*(^|[[:space:]])${codename}([[:space:]]|$)" "${f}" || continue
+        if ! grep -qE "^Suites:.*${codename}-updates" "${f}"; then
+            [[ -f "${f}.previs.bak" ]] || cp "${f}" "${f}.previs.bak"
+            sed -i -E "s/^(Suites:.*[[:space:]]?)${codename}([[:space:]]|$)/\1${codename} ${codename}-updates\2/" "${f}"
+            changed=1
+        fi
+        if grep -qE "^Components:" "${f}" && ! grep -qE "^Components:.*universe" "${f}"; then
+            [[ -f "${f}.previs.bak" ]] || cp "${f}" "${f}.previs.bak"
+            sed -i -E "s/^(Components:.*)$/\1 universe/" "${f}"
+            changed=1
+        fi
+    done
+
+    # Legacy one-line sources.
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+        [[ -f "${f}" ]] || continue
+        grep -qE "^deb .*[[:space:]]${codename}[[:space:]]" "${f}" || continue
+        if ! grep -qE "^deb .*[[:space:]]${codename}-updates[[:space:]]" "${f}"; then
+            [[ -f "${f}.previs.bak" ]] || cp "${f}" "${f}.previs.bak"
+            # Duplicate the release line, pointing it at the '-updates' pocket.
+            local updates_line
+            updates_line="$(sed -nE "s/^(deb .*[[:space:]])${codename}([[:space:]].*)$/\1${codename}-updates\2/p" "${f}" | head -n 1)"
+            if [[ -n "${updates_line}" ]]; then
+                printf '%s\n' "${updates_line}" >> "${f}"
+            fi
+            changed=1
+        fi
+    done
+
+    if (( changed )); then
+        info "Enabled missing apt pockets/components for '${codename}'."
+    fi
+}
+
+ensure_apt_sources
+
 info "Updating package lists..."
 apt-get update -y
 
 info "Installing build tools and audio/video packages..."
-apt-get install -y \
+if ! apt-get install -y \
     build-essential cmake git \
     libyaml-cpp-dev \
     libglfw3-dev libgl1-mesa-dev \
     pulseaudio alsa-utils \
     v4l-utils \
     network-manager
+then
+    error "Failed to install the required packages. This usually means the apt" \
+          "sources on this system are incomplete (for example the" \
+          "'-updates' pocket or the 'universe' component is missing)." \
+          "Check /etc/apt/sources.list and /etc/apt/sources.list.d/, run" \
+          "'sudo apt-get update && sudo apt-get -f install', then re-run this script."
+fi
 
 # ---------------------------------------------------------------------------
 # 2. Pexip Pulse SDK (.deb packages from the doppler repo)
