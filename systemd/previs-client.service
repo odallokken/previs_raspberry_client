@@ -9,9 +9,11 @@ Type=simple
 User=previs
 Group=previs
 
-# Path to the Pexip Pulse runtime and its private siblings.
-Environment="PEX_BASE_PATH=/opt/pexip"
-Environment="LD_LIBRARY_PATH=/opt/pexip/lib"
+# Path to the Pexip Pulse runtime and its private siblings.  The current
+# 'pexninja' SDK package installs here; scripts/install.sh rewrites both paths
+# if the SDK was found somewhere else (older packages used /opt/pexip).
+Environment="PEX_BASE_PATH=/opt/pexninja"
+Environment="LD_LIBRARY_PATH=/opt/pexninja/lib"
 
 ExecStart=/usr/local/bin/previs-client /etc/previs-client/config.yaml
 

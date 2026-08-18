@@ -1,0 +1,4 @@
+# Pulse SDK .deb packages dropped here are picked up automatically by
+# scripts/install.sh, but must not be committed: they are large, closed-source
+# Pexip binaries.
+*.deb

@@ -6,11 +6,21 @@
 #  Run as root (or with sudo) on a freshly flashed Raspberry Pi running
 #  Ubuntu Server 22.04 or 24.04 (64-bit / ARM64):
 #
-#      sudo bash install.sh
+#      sudo bash scripts/install.sh
 #
 #  What this script does:
 #    1. Installs OS build dependencies and audio/video packages.
-#    2. Downloads and installs the Pexip Pulse SDK from the doppler repository.
+#    2. Installs the Pexip Pulse SDK .deb package(s).  Recent SDK releases are
+#       a single 'pexninja_<version>_<arch>.deb'; older ones were
+#       libpexcommon + libpexpulse + libpexpulse-dev.  Both are supported.
+#       They are normally
+#       downloaded automatically from the release configured in
+#       sdk/pulse-sdk.conf, so a plain 'git clone' of this repository is all a
+#       customer needs.  Packages can also be supplied manually:
+#
+#           sudo PULSE_DEB_DIR=/path/to/debs bash scripts/install.sh
+#
+#       or by dropping them into <repo>/sdk/debs/.
 #    3. Builds the previs-client binary with CMake.
 #    4. Installs the binary, config file, and systemd service.
 #    5. Creates a dedicated 'previs' system user.
@@ -25,12 +35,23 @@
 
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The script lives in <repo>/scripts, so the repository root is one level up.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DOPPLER_REPO="https://github.com/pexip/doppler.git"
 DOPPLER_DIR="/tmp/doppler-sdk"
+# The doppler repository checks the Pulse headers straight into the tree.  The
+# runtime-only 'pexninja' package ships no headers, so they are taken from here.
+DOPPLER_INCLUDE_SUBDIR="sdk/linux/opt/pexip/include"
+DOWNLOAD_DIR="/tmp/pulse-sdk-debs"
 BUILD_DIR="/tmp/previs-client-build"
 INSTALL_PREFIX="/usr/local"
-SDK_PREFIX="/opt/pexip"
+
+# Where the Pulse SDK ends up.  The current 'pexninja' package installs to
+# /opt/pexninja; the older libpexpulse packages used /opt/pexip.  The first
+# prefix that actually contains the SDK headers is used.
+SDK_PREFIXES=("/opt/pexninja" "/opt/pexip")
+SDK_PREFIX=""
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 
@@ -42,7 +63,7 @@ error()   { echo -e "${RED}[install]${NC} $*" >&2; exit 1; }
 # 0. Privilege check
 # ---------------------------------------------------------------------------
 if [[ $EUID -ne 0 ]]; then
-    error "Please run as root: sudo bash install.sh"
+    error "Please run as root: sudo bash scripts/install.sh"
 fi
 
 # ---------------------------------------------------------------------------
@@ -109,7 +130,7 @@ apt-get update -y
 
 info "Installing build tools and audio/video packages..."
 if ! apt-get install -y \
-    build-essential cmake git \
+    build-essential cmake git curl ca-certificates \
     libyaml-cpp-dev \
     libglfw3-dev libgl1-mesa-dev \
     pulseaudio alsa-utils \
@@ -124,30 +145,214 @@ then
 fi
 
 # ---------------------------------------------------------------------------
-# 2. Pexip Pulse SDK (.deb packages from the doppler repo)
+# 2. Pexip Pulse SDK (.deb packages)
 # ---------------------------------------------------------------------------
-if [[ -f "${SDK_PREFIX}/include/pexpulse/pulse.h" ]]; then
-    info "Pulse SDK already installed at ${SDK_PREFIX} — skipping."
-else
-    info "Cloning doppler repository to get the Pulse SDK..."
+
+# Print the first known prefix that holds an installed Pulse SDK, or return 1.
+# A prefix counts as an install when it has either the headers or the runtime
+# library: the current 'pexninja' package ships the library only.
+detect_sdk_prefix() {
+    local prefix
+    for prefix in "${SDK_PREFIXES[@]}"; do
+        if [[ -f "${prefix}/include/pexpulse/pulse.h" ]] \
+           || compgen -G "${prefix}/lib/libpexpulse.so*" > /dev/null; then
+            printf '%s\n' "${prefix}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Shallow-clone the public doppler repository into DOPPLER_DIR (once).
+clone_doppler() {
+    [[ -d "${DOPPLER_DIR}/.git" ]] && return 0
     rm -rf "${DOPPLER_DIR}"
     git clone --depth 1 "${DOPPLER_REPO}" "${DOPPLER_DIR}"
+}
 
-    SDK_DEBS="${DOPPLER_DIR}/sdk/linux/debs"
-    if [[ ! -d "${SDK_DEBS}" ]]; then
-        error "Could not find sdk/linux/debs in the doppler repository. " \
-              "Check that the repo structure matches what is expected."
+# Make sure <prefix>/include/pexpulse/pulse.h exists.
+#
+# The Pulse SDK used to ship a libpexpulse-dev package with the headers.  The
+# current 'pexninja' package is runtime only, and Pexip publishes no -dev
+# companion for it, so the headers are taken from the public doppler
+# repository, which checks them into the tree.  They describe a plain C API, so
+# a small version skew against the installed runtime is expected and harmless.
+ensure_sdk_headers() {
+    local prefix="$1"
+    [[ -f "${prefix}/include/pexpulse/pulse.h" ]] && return 0
+
+    info "The installed Pulse SDK ships no headers — fetching them from the doppler repository..."
+    clone_doppler || error "Failed to clone ${DOPPLER_REPO}.  The Pulse headers" \
+                           "are needed to build the client; check this machine's" \
+                           "network/proxy settings."
+
+    local src="${DOPPLER_DIR}/${DOPPLER_INCLUDE_SUBDIR}"
+    [[ -d "${src}" ]] || error "Could not find ${DOPPLER_INCLUDE_SUBDIR} in the" \
+                               "doppler repository.  Check that the repo structure" \
+                               "matches what is expected."
+
+    mkdir -p "${prefix}/include"
+    cp -a "${src}/." "${prefix}/include/"
+
+    [[ -f "${prefix}/include/pexpulse/pulse.h" ]] \
+        || error "Copying the Pulse headers to ${prefix}/include failed."
+
+    info "Pulse headers installed to ${prefix}/include"
+}
+
+# Download the Pulse SDK packages listed in sdk/pulse-sdk.conf for this
+# machine's architecture.  Returns non-zero (without aborting) when no download
+# is configured, so the caller can fall back to another source.
+download_sdk_debs() {
+    local conf="${REPO_DIR}/sdk/pulse-sdk.conf"
+    [[ -f "${conf}" ]] || return 1
+
+    # The config file only ever assigns plain strings to known variables.
+    PULSE_SDK_BASE_URL=""
+    # shellcheck source=/dev/null
+    . "${conf}"
+
+    [[ -n "${PULSE_SDK_BASE_URL}" ]] || return 1
+
+    local files_var="PULSE_SDK_FILES_${DPKG_ARCH}"
+    local sha_var="PULSE_SDK_SHA256_${DPKG_ARCH}"
+    local files=(${!files_var-}) sums=(${!sha_var-})
+
+    if (( ${#files[@]} == 0 )); then
+        error "sdk/pulse-sdk.conf configures a download URL but lists no" \
+              "packages for this machine's architecture (${DPKG_ARCH})." \
+              "Set ${files_var} in that file, or supply the packages with" \
+              "'sudo PULSE_DEB_DIR=/path/to/debs bash scripts/install.sh'."
+    fi
+
+    if (( ${#sums[@]} && ${#sums[@]} != ${#files[@]} )); then
+        error "sdk/pulse-sdk.conf lists ${#sums[@]} checksums for" \
+              "${#files[@]} packages (${DPKG_ARCH}) — they must match one to one."
+    fi
+
+    info "Downloading the Pulse SDK (${DPKG_ARCH}) from ${PULSE_SDK_BASE_URL}..."
+    rm -rf "${DOWNLOAD_DIR}"
+    mkdir -p "${DOWNLOAD_DIR}"
+
+    local i file target
+    for i in "${!files[@]}"; do
+        file="${files[${i}]}"
+        [[ "${file}" != */* ]] || error "Invalid package name '${file}' in sdk/pulse-sdk.conf" \
+                                        "— list file names only, not paths."
+        target="${DOWNLOAD_DIR}/${file}"
+        curl -fL --progress-bar --retry 3 --retry-delay 2 -o "${target}" \
+            "${PULSE_SDK_BASE_URL%/}/${file}" \
+            || error "Failed to download ${file} from ${PULSE_SDK_BASE_URL%/}." \
+                     "Check the URL in sdk/pulse-sdk.conf and this machine's" \
+                     "network/proxy settings."
+
+        if (( ${#sums[@]} )); then
+            printf '%s  %s\n' "${sums[${i}]}" "${target}" | sha256sum -c - > /dev/null \
+                || error "Checksum mismatch for ${file} — the download is" \
+                         "corrupt or the published file has changed."
+        fi
+    done
+
+    if (( ${#sums[@]} == 0 )); then
+        warning "No checksums configured in sdk/pulse-sdk.conf — downloads were not verified."
+    fi
+
+    info "Pulse SDK downloaded to ${DOWNLOAD_DIR}"
+    return 0
+}
+
+if SDK_PREFIX="$(detect_sdk_prefix)"; then
+    info "Pulse SDK already installed at ${SDK_PREFIX} — skipping."
+else
+    DPKG_ARCH="$(dpkg --print-architecture)"
+
+    # Where do the .deb packages come from?  In order of preference:
+    #   1. PULSE_DEB_DIR    — a directory you already have the packages in.
+    #   2. <repo>/sdk/debs  — packages placed alongside this repository.
+    #   3. sdk/pulse-sdk.conf — downloaded from the URL configured there.  This
+    #      is the normal customer path: 'git clone' + run this script.
+    #   4. The doppler repository (upstream; amd64 only at the time of writing).
+    if [[ -n "${PULSE_DEB_DIR:-}" ]]; then
+        [[ -d "${PULSE_DEB_DIR}" ]] || error "PULSE_DEB_DIR '${PULSE_DEB_DIR}' is not a directory."
+        SDK_DEBS="${PULSE_DEB_DIR}"
+        info "Using Pulse SDK .deb packages from ${SDK_DEBS}"
+    elif compgen -G "${REPO_DIR}/sdk/debs/pexninja_*.deb" > /dev/null \
+      || compgen -G "${REPO_DIR}/sdk/debs/libpexpulse_*.deb" > /dev/null; then
+        SDK_DEBS="${REPO_DIR}/sdk/debs"
+        info "Using Pulse SDK .deb packages from ${SDK_DEBS}"
+    elif download_sdk_debs; then
+        SDK_DEBS="${DOWNLOAD_DIR}"
+    else
+        info "Cloning doppler repository to get the Pulse SDK..."
+        clone_doppler || error "Failed to clone ${DOPPLER_REPO} — check this" \
+                               "machine's network/proxy settings."
+
+        SDK_DEBS="${DOPPLER_DIR}/sdk/linux/debs"
+        if [[ ! -d "${SDK_DEBS}" ]]; then
+            error "Could not find sdk/linux/debs in the doppler repository. " \
+                  "Check that the repo structure matches what is expected."
+        fi
     fi
 
     info "Installing Pulse SDK .deb packages..."
-    dpkg -i "${SDK_DEBS}"/libpexcommon_*.deb \
-            "${SDK_DEBS}"/libpexpulse_*.deb   \
-            "${SDK_DEBS}"/libpexpulse-dev_*.deb || true
+
+    # Pick the packages that match this machine's architecture (a Raspberry Pi
+    # running 64-bit Ubuntu is 'arm64').  Installing an 'amd64' package on
+    # arm64 fails with "package architecture (amd64) does not match system
+    # (arm64)".
+    find_deb() {
+        local pkg="$1" deb
+        for deb in "${SDK_DEBS}/${pkg}"_*_"${DPKG_ARCH}".deb \
+                   "${SDK_DEBS}/${pkg}"_*_all.deb; do
+            [[ -f "${deb}" ]] || continue
+            printf '%s\n' "${deb}"
+            return 0
+        done
+        return 1
+    }
+
+    # Current SDK releases are a single 'pexninja' package; older releases
+    # split the SDK into libpexcommon / libpexpulse / libpexpulse-dev.
+    SDK_PACKAGES=()
+    MISSING_PACKAGES=()
+    if deb="$(find_deb pexninja)"; then
+        SDK_PACKAGES+=("${deb}")
+    else
+        for pkg in libpexcommon libpexpulse libpexpulse-dev; do
+            if deb="$(find_deb "${pkg}")"; then
+                SDK_PACKAGES+=("${deb}")
+            else
+                MISSING_PACKAGES+=("${pkg}")
+            fi
+        done
+    fi
+
+    if (( ${#SDK_PACKAGES[@]} == 0 || ${#MISSING_PACKAGES[@]} )); then
+        AVAILABLE="$(ls "${SDK_DEBS}" 2>/dev/null | tr '\n' ' ')"
+        error "No '${DPKG_ARCH}' Pulse SDK packages found: expected either" \
+              "pexninja_<version>_${DPKG_ARCH}.deb or ${MISSING_PACKAGES[*]}." \
+              "Available files in ${SDK_DEBS}: ${AVAILABLE:-<none>}." \
+              "Pexip publishes the Pulse SDK for amd64 only, so on ${DPKG_ARCH}" \
+              "you must supply the packages yourself and point the installer at" \
+              "them:  sudo PULSE_DEB_DIR=/path/to/debs bash scripts/install.sh"
+    fi
+
+    dpkg -i "${SDK_PACKAGES[@]}" || true
     apt-get install -f -y   # resolve any missing dependencies
 
-    rm -rf "${DOPPLER_DIR}"
+    if ! SDK_PREFIX="$(detect_sdk_prefix)"; then
+        error "The Pulse SDK packages did not install correctly — neither" \
+              "include/pexpulse/pulse.h nor lib/libpexpulse.so was found under" \
+              "${SDK_PREFIXES[*]}.  Check the dpkg output above for errors."
+    fi
+
+    rm -rf "${DOWNLOAD_DIR}"
     info "Pulse SDK installed."
 fi
+
+# The runtime-only 'pexninja' package carries no headers; supply them.
+ensure_sdk_headers "${SDK_PREFIX}"
+rm -rf "${DOPPLER_DIR}"
 
 # ---------------------------------------------------------------------------
 # 3. Build
@@ -178,8 +383,13 @@ else
 fi
 
 info "Installing systemd service..."
-install -m 644 "${REPO_DIR}/systemd/previs-client.service" \
-    /etc/systemd/system/previs-client.service
+# The unit ships with default SDK paths; point it at wherever the SDK actually
+# got installed on this machine (/opt/pexninja or /opt/pexip).
+sed -e "s|PEX_BASE_PATH=[^\"]*|PEX_BASE_PATH=${SDK_PREFIX}|" \
+    -e "s|LD_LIBRARY_PATH=[^\"]*|LD_LIBRARY_PATH=${SDK_PREFIX}/lib|" \
+    "${REPO_DIR}/systemd/previs-client.service" \
+    > /etc/systemd/system/previs-client.service
+chmod 644 /etc/systemd/system/previs-client.service
 
 # ---------------------------------------------------------------------------
 # 5. System user
