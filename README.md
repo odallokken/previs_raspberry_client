@@ -207,11 +207,15 @@ If you prefer to build step by step:
 ```bash
 # 1. Install the Pulse SDK (DEBS = the directory holding the .deb packages;
 #    on amd64 you can clone https://github.com/pexip/doppler.git and use
-#    /tmp/doppler/sdk/linux/debs, on arm64 use your own packages)
+#    /tmp/doppler/sdk/linux/debs, on arm64 use your own packages).
+#    Recent SDK releases are a single 'pexninja' package that installs to
+#    /opt/pexninja; older releases were three packages installing to /opt/pexip.
 DEBS=/home/previs/pulse-debs
-sudo dpkg -i "$DEBS"/libpexcommon_*.deb \
-             "$DEBS"/libpexpulse_*.deb   \
-             "$DEBS"/libpexpulse-dev_*.deb
+sudo dpkg -i "$DEBS"/pexninja_*.deb        # new single-package SDK
+# ...or, for the older split packages:
+# sudo dpkg -i "$DEBS"/libpexcommon_*.deb \
+#              "$DEBS"/libpexpulse_*.deb   \
+#              "$DEBS"/libpexpulse-dev_*.deb
 sudo apt-get install -f
 
 # 2. Install build dependencies
@@ -223,7 +227,7 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 
 # 4. Run with a local config
-PEX_BASE_PATH=/opt/pexip ./build/previs-client config.yaml
+PEX_BASE_PATH=/opt/pexninja ./build/previs-client config.yaml
 ```
 
 ---
@@ -252,9 +256,10 @@ described next.
 Do this once per SDK version, on any machine with the packages and the `gh`
 CLI installed:
 
-1. Collect the three packages for every architecture you support — for the
-   Raspberry Pi that is `libpexcommon`, `libpexpulse` and `libpexpulse-dev`,
-   all `_arm64.deb`.
+1. Collect the packages for every architecture you support — for the Raspberry
+   Pi that is the single `pexninja_..._arm64.deb` (recent SDK releases), or the
+   older `libpexcommon`, `libpexpulse` and `libpexpulse-dev` `_arm64.deb`
+   trio.
 2. Note their checksums:
 
    ```bash
@@ -275,8 +280,8 @@ CLI installed:
 
    ```bash
    PULSE_SDK_BASE_URL="https://github.com/odallokken/previs_raspberry_client/releases/download/pulse-sdk-1.0.17841"
-   PULSE_SDK_FILES_arm64="libpexcommon_....deb libpexpulse_....deb libpexpulse-dev_....deb"
-   PULSE_SDK_SHA256_arm64="<sum1> <sum2> <sum3>"
+   PULSE_SDK_FILES_arm64="pexninja_....ubuntu2404_arm64.deb"
+   PULSE_SDK_SHA256_arm64="<sum1>"
    ```
 
    The file names and checksums are space separated and must be listed in the
@@ -320,7 +325,7 @@ previs_raspberry_client/
 | Cannot reach server | `ping <server>` — check network and firewall rules (Pexip uses TCP 443 and UDP 3478/3479) |
 | Wrong PIN | Edit `/etc/previs-client/config.yaml` and restart the service |
 | `dpkg-dev : Depends: bzip2 but it is not installable` during install | The image has an incomplete apt configuration (the `-updates` pocket and/or the `universe` component is missing). The installer now enables them automatically; if it still fails, check `/etc/apt/sources.list` and `/etc/apt/sources.list.d/`, then run `sudo apt-get update && sudo apt-get -f install` |
-| SDK packages not found | Check that the `.deb` files exist in `PULSE_DEB_DIR` / `sdk/debs/` and are named `<package>_<version>_<arch>.deb` |
+| SDK packages not found | Check that the `.deb` files exist in `PULSE_DEB_DIR` / `sdk/debs/` and are named `<package>_<version>_<arch>.deb` (for example `pexninja_1.0.18250...ubuntu2404_arm64.deb`) |
 | `package architecture (amd64) does not match system (arm64)` | The public doppler repository only ships amd64 packages. An arm64 SDK release must be configured in `sdk/pulse-sdk.conf` — see [Where the Pulse SDK comes from](#where-the-pulse-sdk-comes-from) |
 | `Failed to download ...` during install | Check the URL in `sdk/pulse-sdk.conf` is reachable from the Pi (`curl -I <url>`) and that any proxy is configured |
 | `Checksum mismatch for ...` | The published package changed or the download was truncated. Re-run the installer; if it persists, update the checksums in `sdk/pulse-sdk.conf` |

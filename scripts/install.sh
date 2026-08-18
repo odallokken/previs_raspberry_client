@@ -10,7 +10,10 @@
 #
 #  What this script does:
 #    1. Installs OS build dependencies and audio/video packages.
-#    2. Installs the Pexip Pulse SDK .deb packages.  They are normally
+#    2. Installs the Pexip Pulse SDK .deb package(s).  Recent SDK releases are
+#       a single 'pexninja_<version>_<arch>.deb'; older ones were
+#       libpexcommon + libpexpulse + libpexpulse-dev.  Both are supported.
+#       They are normally
 #       downloaded automatically from the release configured in
 #       sdk/pulse-sdk.conf, so a plain 'git clone' of this repository is all a
 #       customer needs.  Packages can also be supplied manually:
@@ -40,7 +43,12 @@ DOPPLER_DIR="/tmp/doppler-sdk"
 DOWNLOAD_DIR="/tmp/pulse-sdk-debs"
 BUILD_DIR="/tmp/previs-client-build"
 INSTALL_PREFIX="/usr/local"
-SDK_PREFIX="/opt/pexip"
+
+# Where the Pulse SDK ends up.  The current 'pexninja' package installs to
+# /opt/pexninja; the older libpexpulse packages used /opt/pexip.  The first
+# prefix that actually contains the SDK headers is used.
+SDK_PREFIXES=("/opt/pexninja" "/opt/pexip")
+SDK_PREFIX=""
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 
@@ -137,6 +145,18 @@ fi
 # 2. Pexip Pulse SDK (.deb packages)
 # ---------------------------------------------------------------------------
 
+# Print the first known prefix that holds an installed Pulse SDK, or return 1.
+detect_sdk_prefix() {
+    local prefix
+    for prefix in "${SDK_PREFIXES[@]}"; do
+        if [[ -f "${prefix}/include/pexpulse/pulse.h" ]]; then
+            printf '%s\n' "${prefix}"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Download the Pulse SDK packages listed in sdk/pulse-sdk.conf for this
 # machine's architecture.  Returns non-zero (without aborting) when no download
 # is configured, so the caller can fall back to another source.
@@ -198,7 +218,7 @@ download_sdk_debs() {
     return 0
 }
 
-if [[ -f "${SDK_PREFIX}/include/pexpulse/pulse.h" ]]; then
+if SDK_PREFIX="$(detect_sdk_prefix)"; then
     info "Pulse SDK already installed at ${SDK_PREFIX} — skipping."
 else
     DPKG_ARCH="$(dpkg --print-architecture)"
@@ -213,7 +233,8 @@ else
         [[ -d "${PULSE_DEB_DIR}" ]] || error "PULSE_DEB_DIR '${PULSE_DEB_DIR}' is not a directory."
         SDK_DEBS="${PULSE_DEB_DIR}"
         info "Using Pulse SDK .deb packages from ${SDK_DEBS}"
-    elif compgen -G "${REPO_DIR}/sdk/debs/libpexpulse_*.deb" > /dev/null; then
+    elif compgen -G "${REPO_DIR}/sdk/debs/pexninja_*.deb" > /dev/null \
+      || compgen -G "${REPO_DIR}/sdk/debs/libpexpulse_*.deb" > /dev/null; then
         SDK_DEBS="${REPO_DIR}/sdk/debs"
         info "Using Pulse SDK .deb packages from ${SDK_DEBS}"
     elif download_sdk_debs; then
@@ -247,19 +268,26 @@ else
         return 1
     }
 
+    # Current SDK releases are a single 'pexninja' package; older releases
+    # split the SDK into libpexcommon / libpexpulse / libpexpulse-dev.
     SDK_PACKAGES=()
     MISSING_PACKAGES=()
-    for pkg in libpexcommon libpexpulse libpexpulse-dev; do
-        if deb="$(find_deb "${pkg}")"; then
-            SDK_PACKAGES+=("${deb}")
-        else
-            MISSING_PACKAGES+=("${pkg}")
-        fi
-    done
+    if deb="$(find_deb pexninja)"; then
+        SDK_PACKAGES+=("${deb}")
+    else
+        for pkg in libpexcommon libpexpulse libpexpulse-dev; do
+            if deb="$(find_deb "${pkg}")"; then
+                SDK_PACKAGES+=("${deb}")
+            else
+                MISSING_PACKAGES+=("${pkg}")
+            fi
+        done
+    fi
 
-    if (( ${#MISSING_PACKAGES[@]} )); then
+    if (( ${#SDK_PACKAGES[@]} == 0 || ${#MISSING_PACKAGES[@]} )); then
         AVAILABLE="$(ls "${SDK_DEBS}" 2>/dev/null | tr '\n' ' ')"
-        error "No '${DPKG_ARCH}' packages found for: ${MISSING_PACKAGES[*]}." \
+        error "No '${DPKG_ARCH}' Pulse SDK packages found: expected either" \
+              "pexninja_<version>_${DPKG_ARCH}.deb or ${MISSING_PACKAGES[*]}." \
               "Available files in ${SDK_DEBS}: ${AVAILABLE:-<none>}." \
               "Pexip publishes the Pulse SDK for amd64 only, so on ${DPKG_ARCH}" \
               "you must supply the packages yourself and point the installer at" \
@@ -269,10 +297,10 @@ else
     dpkg -i "${SDK_PACKAGES[@]}" || true
     apt-get install -f -y   # resolve any missing dependencies
 
-    if [[ ! -f "${SDK_PREFIX}/include/pexpulse/pulse.h" ]]; then
+    if ! SDK_PREFIX="$(detect_sdk_prefix)"; then
         error "The Pulse SDK packages did not install correctly —" \
-              "${SDK_PREFIX}/include/pexpulse/pulse.h is missing." \
-              "Check the dpkg output above for errors."
+              "include/pexpulse/pulse.h was not found under" \
+              "${SDK_PREFIXES[*]}.  Check the dpkg output above for errors."
     fi
 
     rm -rf "${DOPPLER_DIR}" "${DOWNLOAD_DIR}"
@@ -308,8 +336,13 @@ else
 fi
 
 info "Installing systemd service..."
-install -m 644 "${REPO_DIR}/systemd/previs-client.service" \
-    /etc/systemd/system/previs-client.service
+# The unit ships with default SDK paths; point it at wherever the SDK actually
+# got installed on this machine (/opt/pexninja or /opt/pexip).
+sed -e "s|PEX_BASE_PATH=[^\"]*|PEX_BASE_PATH=${SDK_PREFIX}|" \
+    -e "s|LD_LIBRARY_PATH=[^\"]*|LD_LIBRARY_PATH=${SDK_PREFIX}/lib|" \
+    "${REPO_DIR}/systemd/previs-client.service" \
+    > /etc/systemd/system/previs-client.service
+chmod 644 /etc/systemd/system/previs-client.service
 
 # ---------------------------------------------------------------------------
 # 5. System user

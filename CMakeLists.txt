@@ -11,26 +11,33 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # ---------------------------------------------------------------------------
 # Find the Pexip Pulse SDK
 #
-# Install via the .deb packages from the doppler repository:
-#   sudo dpkg -i sdk/linux/debs/libpexcommon_*.deb \
-#                sdk/linux/debs/libpexpulse_*.deb   \
-#                sdk/linux/debs/libpexpulse-dev_*.deb
-#   sudo apt-get install -f
-#
-# The packages install headers to /opt/pexip/include and the library to
-# /opt/pexip/lib.  Override PEXIP_PREFIX if your SDK is elsewhere.
+# Recent SDK releases ship as a single 'pexninja' package that installs to
+# /opt/pexninja (headers in include/, libpexpulse.so and its private siblings
+# in lib/).  Older releases shipped libpexcommon / libpexpulse /
+# libpexpulse-dev, which install to /opt/pexip.  Both layouts are searched;
+# set PEXIP_PREFIX if your SDK lives somewhere else.
 # ---------------------------------------------------------------------------
-set(PEXIP_PREFIX "/opt/pexip" CACHE PATH "Root of the Pexip Pulse SDK install")
+set(PEXIP_PREFIX "" CACHE PATH "Root of the Pexip Pulse SDK install")
+
+set(PEXIP_SEARCH_PREFIXES "/opt/pexninja" "/opt/pexip")
+if(PEXIP_PREFIX)
+    list(INSERT PEXIP_SEARCH_PREFIXES 0 "${PEXIP_PREFIX}")
+endif()
+
+list(TRANSFORM PEXIP_SEARCH_PREFIXES APPEND "/include" OUTPUT_VARIABLE PEXIP_INCLUDE_HINTS)
+list(TRANSFORM PEXIP_SEARCH_PREFIXES APPEND "/lib" OUTPUT_VARIABLE PEXIP_LIBRARY_HINTS)
 
 find_path(PEXIP_INCLUDE_DIR
     NAMES pexpulse/pulse.h
-    HINTS "${PEXIP_PREFIX}/include"
+    HINTS ${PEXIP_INCLUDE_HINTS}
     REQUIRED)
 
 find_library(PEXIP_LIBRARY
     NAMES pexpulse
-    HINTS "${PEXIP_PREFIX}/lib"
+    HINTS ${PEXIP_LIBRARY_HINTS}
     REQUIRED)
+
+get_filename_component(PEXIP_LIBRARY_DIR "${PEXIP_LIBRARY}" DIRECTORY)
 
 add_library(pexip::pulse SHARED IMPORTED)
 set_target_properties(pexip::pulse PROPERTIES
@@ -57,8 +64,8 @@ find_package(Threads REQUIRED)
 # Set RPATH so the binary finds libpexpulse.so at runtime without needing
 # LD_LIBRARY_PATH.
 set_target_properties(previs-client PROPERTIES
-    BUILD_RPATH "${PEXIP_PREFIX}/lib"
-    INSTALL_RPATH "${PEXIP_PREFIX}/lib"
+    BUILD_RPATH "${PEXIP_LIBRARY_DIR}"
+    INSTALL_RPATH "${PEXIP_LIBRARY_DIR}"
     INSTALL_RPATH_USE_LINK_PATH ON)
 
 # ---------------------------------------------------------------------------
