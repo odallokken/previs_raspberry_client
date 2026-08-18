@@ -21,6 +21,16 @@
 # reconnect_delay_seconds
 #               How long to wait before retrying after a call drops.
 #               Minimum 5 seconds.
+#
+# camera        Optional. Part of the name of the capture device to use, e.g.
+# microphone    "USB Camera" or "USB Audio". Matching is case insensitive and
+# speaker       matches anywhere in the device name; the client logs every
+#               device it finds at start-up, so run
+#               'journalctl -u previs-client' to see the exact names.
+#               Leave empty to auto-detect: the client then picks the system
+#               default when it is usable and otherwise the first device that
+#               is not a PulseAudio monitor source or one of the Raspberry Pi's
+#               internal video nodes (bcm2835-isp, pispbe, ...).
 # =============================================================================
 
 server: "vc.example.com"
@@ -28,3 +38,6 @@ vmr: "meet.boardroom"
 display_name: "Raspberry Pi Client"
 pin: ""
 reconnect_delay_seconds: 10
+camera: ""
+microphone: ""
+speaker: ""
