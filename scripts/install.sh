@@ -538,7 +538,8 @@ else
     usermod -d /var/lib/previs-client previs 2>/dev/null || true
 fi
 
-# PulseAudio keeps its configuration and cookie in the user's home directory.
+# PipeWire, WirePlumber and pipewire-pulse keep their configuration and state in
+# the user's home directory.
 mkdir -p /var/lib/previs-client
 chown previs:previs /var/lib/previs-client
 chmod 700 /var/lib/previs-client

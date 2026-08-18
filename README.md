@@ -130,18 +130,22 @@ sudo bash scripts/install.sh
 
 This will:
 1. Install build tools and media packages (`cmake`, `libyaml-cpp-dev`,
-   `pulseaudio`, `alsa-utils`, `v4l-utils`, …).
+   `pipewire`, `pipewire-pulse`, `wireplumber`, `libpipewire-0.3-modules`,
+   `alsa-utils`, `v4l-utils`, …).
 2. Download and install the Pexip Pulse SDK `.deb` packages for this machine's
    architecture (see [Where the Pulse SDK comes from](#where-the-pulse-sdk-comes-from)).
 3. Build the `previs-client` binary from source.
 4. Install the binary to `/usr/local/bin/previs-client`.
 5. Copy `config.yaml` to `/etc/previs-client/config.yaml`.
 6. Install the systemd service units to `/etc/systemd/system/`
-   (`previs-client.service` plus `previs-pulseaudio.service`, the sound server
-   the client talks to — see [Audio: why a dedicated PulseAudio](#audio-why-a-dedicated-pulseaudio)).
+   (`previs-client.service` plus `previs-pipewire.service`,
+   `previs-wireplumber.service` and `previs-pipewire-pulse.service`, the sound
+   server the client talks to — see
+   [Audio: why a dedicated PipeWire stack](#audio-why-a-dedicated-pipewire-stack)).
 7. Create a dedicated `previs` system user (home `/var/lib/previs-client`) and
    add it to the `audio` and `video` groups.
-8. Enable and start the `previs-pulseaudio` and `previs-client` services.
+8. Enable and start the `previs-pipewire`, `previs-wireplumber`,
+   `previs-pipewire-pulse` and `previs-client` services.
 
 ---
 
@@ -234,39 +238,62 @@ The client is entirely headless — no display, no GUI. Video and audio flow
 through the Pexip Pulse SDK using the system's default V4L2 camera and ALSA/
 PulseAudio devices.
 
-### Audio: why a dedicated PulseAudio
+### Audio: why a dedicated PipeWire stack
 
-The Pulse SDK's audio backend talks to a PulseAudio server. PulseAudio normally
-runs once per *login session*, but `previs-client` runs as the `previs` system
-user, which never logs in — so there is no session, no `XDG_RUNTIME_DIR` and no
-sound server to connect to. The symptom is a restart loop logging:
+The Pulse SDK needs two things from the sound system:
+
+* a **PulseAudio-compatible server** — it enumerates cameras, microphones and
+  speakers through `libpulse`; and
+* a **running PipeWire daemon** — its media pipeline is built from GStreamer
+  elements that talk to PipeWire directly (`pipewiresrc` for the microphone,
+  `pipewiresink` for the speaker).
+
+Both normally run once per *login session*, but `previs-client` runs as the
+`previs` system user, which never logs in — so there is no session, no
+`XDG_RUNTIME_DIR` and no sound server to connect to. With no PulseAudio server
+the SDK falls back to raw ALSA and logs:
 
 ```
 [pulse:pulse] Failed to connect: Connection refused
 [pulse:alsa] failed to detect PCM formats
 [pulse:alsa] Got no caps from device: hw:1,0
-[pulse:pulse] Failed to connect: Invalid argument
 ```
 
-(The SDK first tries PulseAudio, then falls back to raw ALSA, which usually
-fails too because the devices are busy or expose no usable format. The same
-situation has also been seen to kill the process with `SIGSEGV`, which systemd
-reports as `Result: core-dump`.)
+With no PipeWire daemon (or with `libpipewire-0.3-modules` missing) it is worse:
+creating the audio element calls `pw_context_connect()`, which dereferences a
+protocol it never created and kills the process with `SIGSEGV`, reported by
+systemd as `Result: core-dump`. The core dump shows the whole chain:
 
-The installer therefore sets up `previs-pulseaudio.service`: a PulseAudio daemon
-that runs **as the `previs` user itself**, without a login session, and puts its
-socket in the runtime directory both units share. `previs-client.service` points
-the SDK at it with `PULSE_SERVER=unix:/run/previs-client/pulse/native`.
+```
+pw_context_connect                        (libpipewire-0.3.so.0)
+gst_element_factory_make_valist           (libpexlgpl.so)
+pmx_device_session_add_audio_input        (libpexpulse.so)
+pulse_device_session_connect_device_by_id (libpexpulse.so)
+```
 
-Running the daemon as the same user as the client (rather than in PulseAudio's
-`--system` mode) means the client owns the socket it connects to, so no cookie,
-`pulse` user or `pulse-access` group membership is involved. `Requires=` plus
-`Type=notify` also guarantee the client is only started once the sound server
-accepts connections, and the client itself waits for the socket before it
-initialises the SDK.
+The installer therefore sets up three units, all running **as the `previs` user
+itself** and sharing the runtime directory `/run/previs-client`:
+
+| Unit | Provides |
+|------|----------|
+| `previs-pipewire.service` | the PipeWire daemon and its socket `/run/previs-client/pipewire-0` |
+| `previs-wireplumber.service` | the session manager that turns ALSA cards and USB webcams into PipeWire nodes |
+| `previs-pipewire-pulse.service` | the PulseAudio-compatible socket `/run/previs-client/pulse/native` |
+
+`previs-client.service` points the SDK at them with
+`PULSE_SERVER=unix:/run/previs-client/pulse/native` and
+`XDG_RUNTIME_DIR=/run/previs-client`. Plain PulseAudio is *not* used any more:
+it cannot serve the SDK's PipeWire elements, and running both would make the two
+fight over the sound cards. An existing `previs-pulseaudio.service` from an
+earlier install is disabled and removed by the installer.
+
+Before touching any device the client verifies the PipeWire runtime itself: it
+looks for `libpipewire-module-protocol-native.so` and waits for the daemon
+socket. If either is missing it logs what to install and joins the call
+**without audio** instead of crashing.
 
 ```bash
-sudo systemctl status previs-pulseaudio
+sudo systemctl status previs-pipewire previs-wireplumber previs-pipewire-pulse
 sudo -u previs env XDG_RUNTIME_DIR=/run/previs-client HOME=/var/lib/previs-client \
      PULSE_SERVER=unix:/run/previs-client/pulse/native pactl info   # should list sinks/sources
 ```
@@ -274,10 +301,9 @@ sudo -u previs env XDG_RUNTIME_DIR=/run/previs-client HOME=/var/lib/previs-clien
 On startup the client logs every camera, microphone and speaker the SDK found;
 device classes that are empty are skipped instead of being attached.
 
-If the machine uses PipeWire instead of PulseAudio, disable the PipeWire
-services (`systemctl --global disable pipewire pipewire-pulse wireplumber`) or
-keep them and point `PULSE_SERVER` at PipeWire's socket instead — the two must
-not both own the sound devices.
+If the machine also runs a desktop session with its own PipeWire or PulseAudio
+instance, make sure it does not own the same sound cards — only one instance can
+open a device at a time.
 
 ---
 
@@ -443,7 +469,9 @@ previs_raspberry_client/
 │   └── debs/                    Optional local Pulse SDK .deb packages (git-ignored)
 ├── systemd/
 │   ├── previs-client.service    systemd unit file
-│   └── previs-pulseaudio.service  PulseAudio daemon unit for the client
+│   ├── previs-pipewire.service  PipeWire daemon unit for the client
+│   ├── previs-wireplumber.service  PipeWire session manager unit
+│   └── previs-pipewire-pulse.service  PulseAudio-compatible server unit
 └── scripts/
     └── install.sh               One-shot installer script
 ```
@@ -457,9 +485,10 @@ previs_raspberry_client/
 | Service fails to start | `sudo journalctl -xe -u previs-client` for the full error |
 | Camera not found | `ls /dev/video*` — ensure the camera is connected; `v4l2-ctl --list-devices` |
 | No audio | `aplay -l` to list playback devices; `arecord -l` to list capture devices |
-| `[pulse:pulse] Failed to connect: Connection refused`, or a restart loop with `Result: core-dump` | No sound server for the headless `previs` user. Check `sudo systemctl status previs-pulseaudio` and `journalctl -u previs-pulseaudio` — see [Audio: why a dedicated PulseAudio](#audio-why-a-dedicated-pulseaudio) |
-| `[pulse:alsa] Could not open device hw:X,0` | Another process (a desktop PulseAudio/PipeWire instance) already owns the device. Stop it, or leave device handling to `previs-pulseaudio` only |
-| `pw.conf: can't load config client.conf` followed by `SIGSEGV` | The Pulse SDK's PipeWire backend has no configuration, and it crashes as soon as a device is attached. The installer installs `libpipewire-0.3-common` and always drops a fallback `client.conf` in `/usr/local/share/previs-client/pipewire`; the client searches that directory (then `/usr/share/pipewire`) and exports `PIPEWIRE_CONFIG_DIR` itself. If the message `No PipeWire client.conf found` appears, no configuration exists anywhere — install it with `sudo apt-get install libpipewire-0.3-common` and restart the service |
+| `[pulse:pulse] Failed to connect: Connection refused` | No PulseAudio-compatible server for the headless `previs` user. Check `sudo systemctl status previs-pipewire-pulse` — see [Audio: why a dedicated PipeWire stack](#audio-why-a-dedicated-pipewire-stack) |
+| Restart loop with `Result: core-dump` right after the microphone list is printed | The SDK's audio element could not reach PipeWire. `coredumpctl info previs-client` shows `pw_context_connect`. Install `libpipewire-0.3-modules` and make sure `previs-pipewire` and `previs-wireplumber` are running; the client now reports `Skipping microphone — no usable PipeWire runtime` instead of crashing |
+| `[pulse:alsa] Could not open device hw:X,0` | Another process (a desktop PulseAudio/PipeWire instance) already owns the device. Stop it, or leave device handling to the `previs-*` units only |
+| `pw.conf: can't load config client.conf` followed by `SIGSEGV` | The Pulse SDK's PipeWire backend has no configuration, and it crashes as soon as a device is attached. The installer installs `libpipewire-0.3-common` and always drops a fallback `client.conf` in `/usr/local/share/previs-client/pipewire`; the client searches `/usr/share/pipewire` first, then that fallback, and exports `PIPEWIRE_CONFIG_DIR` itself. If the message `No PipeWire client.conf found` appears, no configuration exists anywhere — install it with `sudo apt-get install libpipewire-0.3-common` and restart the service |
 | `Failed to attach camera "bcm2835-isp"` / camera never used | `bcm2835-isp` is the Pi's image-signal-processor node, not a camera. The client skips it and falls back to the next device; pin the right one with `camera:` in `config.yaml` if needed |
 | `No usable microphone device — skipping` with only `Monitor of ...` entries listed | No capture device is connected. Monitor sources are playback loopbacks and are deliberately not attached (doing so crashed the SDK); connect a USB microphone, or pin it with `microphone:` |
 | Cannot reach server | `ping <server>` — check network and firewall rules (Pexip uses TCP 443 and UDP 3478/3479) |
