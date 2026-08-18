@@ -27,6 +27,8 @@
 #include <string>
 #include <thread>
 
+#include <sys/stat.h>
+
 #include <yaml-cpp/yaml.h>
 
 #include <pexpulse/pulse.h>
@@ -164,6 +166,65 @@ static void on_pulse_log(void * /*ctx*/, PulseDebugLevel level,
 }
 
 // ---------------------------------------------------------------------------
+//  Sound server
+// ---------------------------------------------------------------------------
+
+// Where the PulseAudio socket should be, according to the environment.
+// Returns an empty string when it cannot be derived.
+static std::string pulse_socket_path()
+{
+    const char * server = std::getenv("PULSE_SERVER");
+    if (server && std::strncmp(server, "unix:", 5) == 0) return server + 5;
+    if (server && server[0] == '/')                      return server;
+
+    const char * runtime = std::getenv("PULSE_RUNTIME_PATH");
+    if (runtime && runtime[0]) return std::string(runtime) + "/native";
+
+    const char * xdg = std::getenv("XDG_RUNTIME_DIR");
+    if (xdg && xdg[0]) return std::string(xdg) + "/pulse/native";
+
+    return {};
+}
+
+// The Pulse SDK opens its audio backend while the instance is being created,
+// so the sound server has to be up first: without it the SDK falls back to raw
+// ALSA, floods the journal with "Failed to connect"/"Got no caps from device"
+// and can die with SIGSEGV.  systemd orders us after previs-pulseaudio.service,
+// but wait here too so a manually started client behaves the same.
+static bool wait_for_sound_server(const AppState & app, int timeout_seconds = 30)
+{
+    const std::string path = pulse_socket_path();
+    if (path.empty()) {
+        std::fprintf(stderr,
+                     "[client] PULSE_SERVER is not set — the Pulse SDK will look"
+                     " for a sound server on its own.\n");
+        return false;
+    }
+
+    struct stat st{};
+    for (int waited = 0; waited < timeout_seconds * 10; ++waited) {
+        if (stat(path.c_str(), &st) == 0) {
+            if (waited > 0)
+                std::printf("[client] Sound server socket appeared after %.1fs\n",
+                            waited / 10.0);
+            return true;
+        }
+        if (app.shutdown_requested.load()) return false;
+        if (waited == 0)
+            std::printf("[client] Waiting for the sound server at %s ...\n",
+                        path.c_str());
+        std::fflush(stdout);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    std::fprintf(stderr,
+                 "[client] No sound server at %s after %ds.\n"
+                 "[client] Check it with:  systemctl status previs-pulseaudio\n",
+                 path.c_str(), timeout_seconds);
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 //  Pulse helpers
 // ---------------------------------------------------------------------------
 
@@ -181,6 +242,34 @@ static void install_callbacks(AppState & app)
     pulse_options_set_preflight_video_window_handle(app.pulse, nullptr);
 }
 
+// Report how many devices the SDK found, and log their names.  Returns the
+// device count, or -1 when the list could not be read at all.
+static int list_devices(AppState & app, const char * label,
+                        PulseMediaType type, PulseMediaDirection direction)
+{
+    PulseDeviceIterator * it = nullptr;
+    PulseError err = pulse_device_iterator_new(app.pulse, type, direction, &it);
+    if (err != PULSE_SUCCESS || !it) {
+        std::fprintf(stderr, "[client] Could not list %s devices: %s\n",
+                     label, pulse_strerror(err));
+        if (it) pulse_device_iterator_free(it);
+        return -1;
+    }
+
+    int count = pulse_device_iterator_item_count(it);
+    for (const PulseDevice * dev = pulse_device_iterator_first(it);
+         dev != nullptr;
+         dev = pulse_device_iterator_next(it)) {
+        const char * name = pulse_device_get_name(dev);
+        std::printf("[client]   %s: %s%s\n", label, name ? name : "(unnamed)",
+                    pulse_device_is_system_default(dev) ? "  (default)" : "");
+    }
+    std::fflush(stdout);
+
+    pulse_device_iterator_free(it);
+    return count;
+}
+
 static void connect_default_devices(AppState & app)
 {
     struct Binding {
@@ -196,6 +285,18 @@ static void connect_default_devices(AppState & app)
 
     int audio_failures = 0;
     for (const auto & b : bindings) {
+        // Only bind a device class the SDK actually enumerated.  Asking it for
+        // the "system default" of an empty class makes the media backend walk
+        // a device it never opened, which has been seen to abort the process
+        // with SIGSEGV on machines without a working sound server.
+        int count = list_devices(app, b.name, b.type, b.direction);
+        if (count <= 0) {
+            std::fprintf(stderr, "[client] No %s device available — skipping.\n",
+                         b.name);
+            if (b.type == PULSE_MEDIA_AUDIO) ++audio_failures;
+            continue;
+        }
+
         PulseError err = pulse_device_session_connect_system_default(
             app.pulse, PULSE_MEDIA_CONTENT_MAIN, b.type, b.direction);
         if (err != PULSE_SUCCESS) {
@@ -206,10 +307,11 @@ static void connect_default_devices(AppState & app)
     }
 
     // The Pulse SDK talks to a PulseAudio server.  When the client runs as a
-    // headless system user there is no per-user daemon, so a system-wide one
-    // must be running and PULSE_SERVER must point at its socket — otherwise
-    // the SDK logs "Failed to connect: Connection refused" and falls back to
-    // raw ALSA, which normally cannot open the devices either.
+    // headless system user there is no automatically started daemon, so
+    // previs-pulseaudio.service must be running and PULSE_SERVER must point at
+    // its socket — otherwise the SDK logs "Failed to connect: Connection
+    // refused" and falls back to raw ALSA, which normally cannot open the
+    // devices either.
     if (audio_failures > 0) {
         const char * server = std::getenv("PULSE_SERVER");
         std::fprintf(stderr,
@@ -308,6 +410,10 @@ int main(int argc, char * argv[])
 
     // Global Pulse logging hook (optional — keeps the console readable).
     pulse_global_logger_callback(on_pulse_log, nullptr);
+
+    // Must happen before pulse_new(): the SDK initialises its audio backend
+    // while creating the instance.
+    wait_for_sound_server(app);
 
     // Create and configure the Pulse instance.
     app.pulse = pulse_new();

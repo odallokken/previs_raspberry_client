@@ -121,10 +121,10 @@ This will:
 4. Install the binary to `/usr/local/bin/previs-client`.
 5. Copy `config.yaml` to `/etc/previs-client/config.yaml`.
 6. Install the systemd service units to `/etc/systemd/system/`
-   (`previs-client.service` plus `previs-pulseaudio.service`, a system-wide
-   PulseAudio daemon — see [Audio: why a system-wide PulseAudio](#audio-why-a-system-wide-pulseaudio)).
-7. Create a dedicated `previs` system user and add it to the `audio`, `video`
-   and `pulse-access` groups.
+   (`previs-client.service` plus `previs-pulseaudio.service`, the sound server
+   the client talks to — see [Audio: why a dedicated PulseAudio](#audio-why-a-dedicated-pulseaudio)).
+7. Create a dedicated `previs` system user (home `/var/lib/previs-client`) and
+   add it to the `audio` and `video` groups.
 8. Enable and start the `previs-pulseaudio` and `previs-client` services.
 
 ---
@@ -218,7 +218,7 @@ The client is entirely headless — no display, no GUI. Video and audio flow
 through the Pexip Pulse SDK using the system's default V4L2 camera and ALSA/
 PulseAudio devices.
 
-### Audio: why a system-wide PulseAudio
+### Audio: why a dedicated PulseAudio
 
 The Pulse SDK's audio backend talks to a PulseAudio server. PulseAudio normally
 runs once per *login session*, but `previs-client` runs as the `previs` system
@@ -233,17 +233,30 @@ sound server to connect to. The symptom is a restart loop logging:
 ```
 
 (The SDK first tries PulseAudio, then falls back to raw ALSA, which usually
-fails too because the devices are busy or expose no usable format.)
+fails too because the devices are busy or expose no usable format. The same
+situation has also been seen to kill the process with `SIGSEGV`, which systemd
+reports as `Result: core-dump`.)
 
-The installer therefore sets up `previs-pulseaudio.service`, a system-wide
-PulseAudio daemon that runs without a session, and `previs-client.service`
-points the SDK at it with `PULSE_SERVER=unix:/run/pulse/native`. The `previs`
-user is added to `pulse-access` so it is allowed to connect.
+The installer therefore sets up `previs-pulseaudio.service`: a PulseAudio daemon
+that runs **as the `previs` user itself**, without a login session, and puts its
+socket in the runtime directory both units share. `previs-client.service` points
+the SDK at it with `PULSE_SERVER=unix:/run/previs-client/pulse/native`.
+
+Running the daemon as the same user as the client (rather than in PulseAudio's
+`--system` mode) means the client owns the socket it connects to, so no cookie,
+`pulse` user or `pulse-access` group membership is involved. `Requires=` plus
+`Type=notify` also guarantee the client is only started once the sound server
+accepts connections, and the client itself waits for the socket before it
+initialises the SDK.
 
 ```bash
 sudo systemctl status previs-pulseaudio
-sudo -u previs PULSE_SERVER=unix:/run/pulse/native pactl info   # should list sinks/sources
+sudo -u previs env XDG_RUNTIME_DIR=/run/previs-client HOME=/var/lib/previs-client \
+     PULSE_SERVER=unix:/run/previs-client/pulse/native pactl info   # should list sinks/sources
 ```
+
+On startup the client logs every camera, microphone and speaker the SDK found;
+device classes that are empty are skipped instead of being attached.
 
 If the machine uses PipeWire instead of PulseAudio, disable the PipeWire
 services (`systemctl --global disable pipewire pipewire-pulse wireplumber`) or
@@ -414,7 +427,7 @@ previs_raspberry_client/
 │   └── debs/                    Optional local Pulse SDK .deb packages (git-ignored)
 ├── systemd/
 │   ├── previs-client.service    systemd unit file
-│   └── previs-pulseaudio.service  system-wide PulseAudio daemon unit
+│   └── previs-pulseaudio.service  PulseAudio daemon unit for the client
 └── scripts/
     └── install.sh               One-shot installer script
 ```
@@ -428,7 +441,7 @@ previs_raspberry_client/
 | Service fails to start | `sudo journalctl -xe -u previs-client` for the full error |
 | Camera not found | `ls /dev/video*` — ensure the camera is connected; `v4l2-ctl --list-devices` |
 | No audio | `aplay -l` to list playback devices; `arecord -l` to list capture devices |
-| `[pulse:pulse] Failed to connect: Connection refused` and a restart loop | No sound server for the headless `previs` user. Check `sudo systemctl status previs-pulseaudio` and that `previs` is in the `pulse-access` group (`id previs`) — see [Audio: why a system-wide PulseAudio](#audio-why-a-system-wide-pulseaudio) |
+| `[pulse:pulse] Failed to connect: Connection refused`, or a restart loop with `Result: core-dump` | No sound server for the headless `previs` user. Check `sudo systemctl status previs-pulseaudio` and `journalctl -u previs-pulseaudio` — see [Audio: why a dedicated PulseAudio](#audio-why-a-dedicated-pulseaudio) |
 | `[pulse:alsa] Could not open device hw:X,0` | Another process (a desktop PulseAudio/PipeWire instance) already owns the device. Stop it, or leave device handling to `previs-pulseaudio` only |
 | Cannot reach server | `ping <server>` — check network and firewall rules (Pexip uses TCP 443 and UDP 3478/3479) |
 | Wrong PIN | Edit `/etc/previs-client/config.yaml` and restart the service |

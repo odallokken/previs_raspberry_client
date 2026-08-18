@@ -2,7 +2,11 @@
 Description=Previs Pexip Video Client
 Documentation=https://github.com/odallokken/previs_raspberry_client
 After=network-online.target sound.target previs-pulseaudio.service
-Wants=network-online.target previs-pulseaudio.service
+Wants=network-online.target
+# The Pulse SDK is unusable (and has been seen to crash) without a sound
+# server, so the client is only started once previs-pulseaudio is up.  'Type=
+# notify' on that unit means "up" really does mean "accepting connections".
+Requires=previs-pulseaudio.service
 
 [Service]
 Type=simple
@@ -16,14 +20,23 @@ Environment="PEX_BASE_PATH=/opt/pexninja"
 Environment="LD_LIBRARY_PATH=/opt/pexninja/lib"
 
 # The client runs as a headless system user with no login session, so there is
-# no per-user PulseAudio daemon and no XDG_RUNTIME_DIR.  Point the Pulse SDK at
-# the system-wide sound server started by previs-pulseaudio.service; without
-# this the SDK logs "Failed to connect: Connection refused" and falls back to
-# raw ALSA, which then fails to open the capture/playback devices.
-Environment="PULSE_SERVER=unix:/run/pulse/native"
+# no automatically started PulseAudio daemon and no XDG_RUNTIME_DIR.  Point the
+# Pulse SDK at the daemon started by previs-pulseaudio.service, which runs as
+# the same user and puts its socket in this runtime directory; without this the
+# SDK logs "Failed to connect: Connection refused" and falls back to raw ALSA,
+# which then fails to open the capture/playback devices.
 Environment="XDG_RUNTIME_DIR=/run/previs-client"
+Environment="PULSE_RUNTIME_PATH=/run/previs-client/pulse"
+Environment="PULSE_SERVER=unix:/run/previs-client/pulse/native"
 RuntimeDirectory=previs-client
 RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+
+# Same private home directory as the sound server, so the two agree on where
+# PulseAudio's client configuration lives.
+StateDirectory=previs-client
+Environment="HOME=/var/lib/previs-client"
+Environment="XDG_CONFIG_HOME=/var/lib/previs-client/.config"
 
 ExecStart=/usr/local/bin/previs-client /etc/previs-client/config.yaml
 
@@ -34,9 +47,8 @@ RestartSec=10s
 # Give Pulse enough time to shut down gracefully on SIGTERM before SIGKILL.
 TimeoutStopSec=15s
 
-# Allow access to audio/video devices.  'pulse-access' is what the system-wide
-# PulseAudio daemon grants clients access with.
-SupplementaryGroups=audio video render pulse-access
+# Allow access to audio/video devices.
+SupplementaryGroups=audio video render
 
 [Install]
 WantedBy=multi-user.target
