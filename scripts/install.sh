@@ -10,13 +10,14 @@
 #
 #  What this script does:
 #    1. Installs OS build dependencies and audio/video packages.
-#    2. Installs the Pexip Pulse SDK .deb packages.  By default they are taken
-#       from the doppler repository, which only publishes amd64 builds; on a
-#       Raspberry Pi (arm64) supply your own packages instead:
+#    2. Installs the Pexip Pulse SDK .deb packages.  They are normally
+#       downloaded automatically from the release configured in
+#       sdk/pulse-sdk.conf, so a plain 'git clone' of this repository is all a
+#       customer needs.  Packages can also be supplied manually:
 #
 #           sudo PULSE_DEB_DIR=/path/to/debs bash scripts/install.sh
 #
-#       or drop them into <repo>/sdk/debs/ and they are picked up automatically.
+#       or by dropping them into <repo>/sdk/debs/.
 #    3. Builds the previs-client binary with CMake.
 #    4. Installs the binary, config file, and systemd service.
 #    5. Creates a dedicated 'previs' system user.
@@ -36,6 +37,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DOPPLER_REPO="https://github.com/pexip/doppler.git"
 DOPPLER_DIR="/tmp/doppler-sdk"
+DOWNLOAD_DIR="/tmp/pulse-sdk-debs"
 BUILD_DIR="/tmp/previs-client-build"
 INSTALL_PREFIX="/usr/local"
 SDK_PREFIX="/opt/pexip"
@@ -117,7 +119,7 @@ apt-get update -y
 
 info "Installing build tools and audio/video packages..."
 if ! apt-get install -y \
-    build-essential cmake git \
+    build-essential cmake git curl ca-certificates \
     libyaml-cpp-dev \
     libglfw3-dev libgl1-mesa-dev \
     pulseaudio alsa-utils \
@@ -134,20 +136,79 @@ fi
 # ---------------------------------------------------------------------------
 # 2. Pexip Pulse SDK (.deb packages)
 # ---------------------------------------------------------------------------
+
+# Download the Pulse SDK packages listed in sdk/pulse-sdk.conf for this
+# machine's architecture.  Returns non-zero (without aborting) when no download
+# is configured, so the caller can fall back to another source.
+download_sdk_debs() {
+    local conf="${REPO_DIR}/sdk/pulse-sdk.conf"
+    [[ -f "${conf}" ]] || return 1
+
+    # The config file only ever assigns plain strings to known variables.
+    PULSE_SDK_BASE_URL=""
+    # shellcheck source=/dev/null
+    . "${conf}"
+
+    [[ -n "${PULSE_SDK_BASE_URL}" ]] || return 1
+
+    local files_var="PULSE_SDK_FILES_${DPKG_ARCH}"
+    local sha_var="PULSE_SDK_SHA256_${DPKG_ARCH}"
+    local files=(${!files_var-}) sums=(${!sha_var-})
+
+    if (( ${#files[@]} == 0 )); then
+        error "sdk/pulse-sdk.conf configures a download URL but lists no" \
+              "packages for this machine's architecture (${DPKG_ARCH})." \
+              "Set ${files_var} in that file, or supply the packages with" \
+              "'sudo PULSE_DEB_DIR=/path/to/debs bash scripts/install.sh'."
+    fi
+
+    if (( ${#sums[@]} && ${#sums[@]} != ${#files[@]} )); then
+        error "sdk/pulse-sdk.conf lists ${#sums[@]} checksums for" \
+              "${#files[@]} packages (${DPKG_ARCH}) — they must match one to one."
+    fi
+
+    info "Downloading the Pulse SDK (${DPKG_ARCH}) from ${PULSE_SDK_BASE_URL}..."
+    rm -rf "${DOWNLOAD_DIR}"
+    mkdir -p "${DOWNLOAD_DIR}"
+
+    local i file target
+    for i in "${!files[@]}"; do
+        file="${files[${i}]}"
+        [[ "${file}" != */* ]] || error "Invalid package name '${file}' in sdk/pulse-sdk.conf" \
+                                        "— list file names only, not paths."
+        target="${DOWNLOAD_DIR}/${file}"
+        curl -fL --progress-bar --retry 3 --retry-delay 2 -o "${target}" \
+            "${PULSE_SDK_BASE_URL%/}/${file}" \
+            || error "Failed to download ${file} from ${PULSE_SDK_BASE_URL%/}." \
+                     "Check the URL in sdk/pulse-sdk.conf and this machine's" \
+                     "network/proxy settings."
+
+        if (( ${#sums[@]} )); then
+            printf '%s  %s\n' "${sums[${i}]}" "${target}" | sha256sum -c - > /dev/null \
+                || error "Checksum mismatch for ${file} — the download is" \
+                         "corrupt or the published file has changed."
+        fi
+    done
+
+    if (( ${#sums[@]} == 0 )); then
+        warning "No checksums configured in sdk/pulse-sdk.conf — downloads were not verified."
+    fi
+
+    info "Pulse SDK downloaded to ${DOWNLOAD_DIR}"
+    return 0
+}
+
 if [[ -f "${SDK_PREFIX}/include/pexpulse/pulse.h" ]]; then
     info "Pulse SDK already installed at ${SDK_PREFIX} — skipping."
 else
     DPKG_ARCH="$(dpkg --print-architecture)"
 
     # Where do the .deb packages come from?  In order of preference:
-    #   1. PULSE_DEB_DIR   — a directory you already have the packages in.
-    #   2. <repo>/sdk/debs — packages committed alongside this repository.
-    #   3. The doppler repository (upstream; amd64 only at the time of writing).
-    #
-    # Pexip currently publishes the Pulse SDK for amd64 only, so on a Raspberry
-    # Pi (arm64) you have to supply arm64 packages yourself:
-    #
-    #     sudo PULSE_DEB_DIR=/path/to/debs bash scripts/install.sh
+    #   1. PULSE_DEB_DIR    — a directory you already have the packages in.
+    #   2. <repo>/sdk/debs  — packages placed alongside this repository.
+    #   3. sdk/pulse-sdk.conf — downloaded from the URL configured there.  This
+    #      is the normal customer path: 'git clone' + run this script.
+    #   4. The doppler repository (upstream; amd64 only at the time of writing).
     if [[ -n "${PULSE_DEB_DIR:-}" ]]; then
         [[ -d "${PULSE_DEB_DIR}" ]] || error "PULSE_DEB_DIR '${PULSE_DEB_DIR}' is not a directory."
         SDK_DEBS="${PULSE_DEB_DIR}"
@@ -155,6 +216,8 @@ else
     elif compgen -G "${REPO_DIR}/sdk/debs/libpexpulse_*.deb" > /dev/null; then
         SDK_DEBS="${REPO_DIR}/sdk/debs"
         info "Using Pulse SDK .deb packages from ${SDK_DEBS}"
+    elif download_sdk_debs; then
+        SDK_DEBS="${DOWNLOAD_DIR}"
     else
         info "Cloning doppler repository to get the Pulse SDK..."
         rm -rf "${DOPPLER_DIR}"
@@ -212,7 +275,7 @@ else
               "Check the dpkg output above for errors."
     fi
 
-    rm -rf "${DOPPLER_DIR}"
+    rm -rf "${DOPPLER_DIR}" "${DOWNLOAD_DIR}"
     info "Pulse SDK installed."
 fi
 

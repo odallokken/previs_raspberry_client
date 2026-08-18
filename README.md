@@ -94,25 +94,6 @@ reconnect_delay_seconds: 10
 The installer script handles everything: SDK installation, build, system user
 creation, and systemd service setup.
 
-> **Raspberry Pi (arm64) users — read this first.** The public
-> [doppler](https://github.com/pexip/doppler) repository only publishes the
-> Pulse SDK for **amd64**. Those packages cannot be installed on a Pi
-> (`dpkg` reports *"package architecture (amd64) does not match system
-> (arm64)"*). Obtain the arm64 `libpexcommon`, `libpexpulse` and
-> `libpexpulse-dev` packages from Pexip, copy them onto the Pi, and point the
-> installer at them:
->
-> ```bash
-> sudo PULSE_DEB_DIR=/home/previs/pulse-debs bash scripts/install.sh
-> ```
->
-> Alternatively drop the `.deb` files into `sdk/debs/` inside this repository
-> and they are picked up automatically. **Do not commit them** — they are large
-> closed-source Pexip binaries, so `sdk/debs/.gitignore` deliberately excludes
-> them. To share them across several machines, host them somewhere your Pis can
-> reach (an internal file server, or a GitHub Release on a private repo, if your
-> licence with Pexip permits it) and download them before running the installer.
-
 ```bash
 sudo bash scripts/install.sh
 ```
@@ -120,10 +101,8 @@ sudo bash scripts/install.sh
 This will:
 1. Install build tools and media packages (`cmake`, `libyaml-cpp-dev`,
    `pulseaudio`, `alsa-utils`, `v4l-utils`, …).
-2. Install the Pexip Pulse SDK `.deb` packages, taken from `PULSE_DEB_DIR`,
-   from `sdk/debs/`, or — as a last resort — from a clone of the
-   [doppler](https://github.com/pexip/doppler) repository. Only packages
-   matching the machine's architecture are installed.
+2. Download and install the Pexip Pulse SDK `.deb` packages for this machine's
+   architecture (see [Where the Pulse SDK comes from](#where-the-pulse-sdk-comes-from)).
 3. Build the `previs-client` binary from source.
 4. Install the binary to `/usr/local/bin/previs-client`.
 5. Copy `config.yaml` to `/etc/previs-client/config.yaml`.
@@ -249,6 +228,69 @@ PEX_BASE_PATH=/opt/pexip ./build/previs-client config.yaml
 
 ---
 
+## Where the Pulse SDK comes from
+
+The client links against the closed-source **Pexip Pulse SDK**, shipped as
+`.deb` packages. They are far too large to commit to git, so the installer
+fetches them. It looks in these places, in order, and uses the first that has
+packages matching the machine's architecture (`arm64` on a Raspberry Pi,
+`amd64` on a PC):
+
+| # | Source | When it applies |
+|---|--------|-----------------|
+| 1 | `PULSE_DEB_DIR=/path/to/debs` | You already have the packages on the machine |
+| 2 | `sdk/debs/` inside this repository | You copied the packages in; the directory is git-ignored |
+| 3 | The URL configured in `sdk/pulse-sdk.conf` | **The normal customer path** — downloaded automatically |
+| 4 | A clone of [pexip/doppler](https://github.com/pexip/doppler) | Fallback; upstream publishes **amd64 only** |
+
+For customers this should be invisible: clone the repository and run the
+installer. That only works once the maintainer has published the packages, as
+described next.
+
+### Publishing the Pulse SDK (maintainers)
+
+Do this once per SDK version, on any machine with the packages and the `gh`
+CLI installed:
+
+1. Collect the three packages for every architecture you support — for the
+   Raspberry Pi that is `libpexcommon`, `libpexpulse` and `libpexpulse-dev`,
+   all `_arm64.deb`.
+2. Note their checksums:
+
+   ```bash
+   sha256sum *.deb
+   ```
+
+3. Create a release on this repository and attach the packages:
+
+   ```bash
+   gh release create pulse-sdk-1.0.17841 *.deb \
+       --repo odallokken/previs_raspberry_client \
+       --title "Pexip Pulse SDK 1.0.17841" \
+       --notes "Pulse SDK packages used by scripts/install.sh"
+   ```
+
+4. Fill in `sdk/pulse-sdk.conf` with the release URL, the exact file names and
+   the checksums from step 2, then commit it:
+
+   ```bash
+   PULSE_SDK_BASE_URL="https://github.com/odallokken/previs_raspberry_client/releases/download/pulse-sdk-1.0.17841"
+   PULSE_SDK_FILES_arm64="libpexcommon_....deb libpexpulse_....deb libpexpulse-dev_....deb"
+   PULSE_SDK_SHA256_arm64="<sum1> <sum2> <sum3>"
+   ```
+
+   The file names and checksums are space separated and must be listed in the
+   same order.
+
+From then on, every customer install is just `git clone` + `sudo bash
+scripts/install.sh`.
+
+> **Licensing:** the Pulse SDK is Pexip's closed-source software. Confirm with
+> Pexip that you may redistribute the packages before publishing them, and use
+> a private repository or an internal file server if you may not.
+
+---
+
 ## Repository layout
 
 ```
@@ -258,7 +300,8 @@ previs_raspberry_client/
 ├── src/
 │   └── main.cpp                 Application source (C++17)
 ├── sdk/
-│   └── debs/                    Drop Pulse SDK .deb packages here (git-ignored)
+│   ├── pulse-sdk.conf           Where the installer downloads the Pulse SDK from
+│   └── debs/                    Optional local Pulse SDK .deb packages (git-ignored)
 ├── systemd/
 │   └── previs-client.service    systemd unit file
 └── scripts/
@@ -278,4 +321,6 @@ previs_raspberry_client/
 | Wrong PIN | Edit `/etc/previs-client/config.yaml` and restart the service |
 | `dpkg-dev : Depends: bzip2 but it is not installable` during install | The image has an incomplete apt configuration (the `-updates` pocket and/or the `universe` component is missing). The installer now enables them automatically; if it still fails, check `/etc/apt/sources.list` and `/etc/apt/sources.list.d/`, then run `sudo apt-get update && sudo apt-get -f install` |
 | SDK packages not found | Check that the `.deb` files exist in `PULSE_DEB_DIR` / `sdk/debs/` and are named `<package>_<version>_<arch>.deb` |
-| `package architecture (amd64) does not match system (arm64)` | The doppler repository only ships amd64 packages. Get arm64 packages from Pexip and run `sudo PULSE_DEB_DIR=/path/to/debs bash scripts/install.sh` |
+| `package architecture (amd64) does not match system (arm64)` | The public doppler repository only ships amd64 packages. An arm64 SDK release must be configured in `sdk/pulse-sdk.conf` — see [Where the Pulse SDK comes from](#where-the-pulse-sdk-comes-from) |
+| `Failed to download ...` during install | Check the URL in `sdk/pulse-sdk.conf` is reachable from the Pi (`curl -I <url>`) and that any proxy is configured |
+| `Checksum mismatch for ...` | The published package changed or the download was truncated. Re-run the installer; if it persists, update the checksums in `sdk/pulse-sdk.conf` |
