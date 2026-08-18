@@ -90,6 +90,9 @@ nano config.yaml
 | `display_name` | Name shown for this device in the participant list | `Raspberry Pi - Room 1` |
 | `pin` | Host or guest PIN (leave empty string `""` if none) | `1234` |
 | `reconnect_delay_seconds` | Seconds to wait before re-dialling after a call drops (minimum 5) | `10` |
+| `camera` | Optional. Part of the camera name to use; empty means auto-detect | `USB Camera` |
+| `microphone` | Optional. Part of the capture device name to use; empty means auto-detect | `USB Audio` |
+| `speaker` | Optional. Part of the playback device name to use; empty means auto-detect | `HDMI` |
 
 Example `config.yaml`:
 
@@ -99,7 +102,20 @@ vmr: "meet.boardroom"
 display_name: "Boardroom Pi"
 pin: ""
 reconnect_delay_seconds: 10
+camera: ""
+microphone: ""
+speaker: ""
 ```
+
+The client logs every device it finds at start-up, so `journalctl -u
+previs-client` shows the exact names to put in `camera` / `microphone` /
+`speaker`. When they are left empty the client auto-detects: it uses the system
+default when that device can actually serve the role, and otherwise walks the
+remaining devices. PulseAudio monitor sources (`Monitor of ...`, which are
+loopbacks of playback, not microphones) and the Raspberry Pi's internal video
+nodes (`bcm2835-isp`, `bcm2835-codec`, `pispbe`, ...) are skipped, so a
+connected USB camera is used even when the ISP node is the system default. A
+missing camera or microphone no longer stops the client from dialling in.
 
 ---
 
@@ -443,6 +459,9 @@ previs_raspberry_client/
 | No audio | `aplay -l` to list playback devices; `arecord -l` to list capture devices |
 | `[pulse:pulse] Failed to connect: Connection refused`, or a restart loop with `Result: core-dump` | No sound server for the headless `previs` user. Check `sudo systemctl status previs-pulseaudio` and `journalctl -u previs-pulseaudio` — see [Audio: why a dedicated PulseAudio](#audio-why-a-dedicated-pulseaudio) |
 | `[pulse:alsa] Could not open device hw:X,0` | Another process (a desktop PulseAudio/PipeWire instance) already owns the device. Stop it, or leave device handling to `previs-pulseaudio` only |
+| `pw.conf: can't load config client.conf` followed by `SIGSEGV` | The Pulse SDK's PipeWire backend has no configuration. Install it with `sudo apt-get install libpipewire-0.3-common` (the installer does this) — the unit sets `PIPEWIRE_CONFIG_DIR=/usr/share/pipewire` |
+| `Failed to attach camera "bcm2835-isp"` / camera never used | `bcm2835-isp` is the Pi's image-signal-processor node, not a camera. The client skips it and falls back to the next device; pin the right one with `camera:` in `config.yaml` if needed |
+| `No usable microphone device — skipping` with only `Monitor of ...` entries listed | No capture device is connected. Monitor sources are playback loopbacks and are deliberately not attached (doing so crashed the SDK); connect a USB microphone, or pin it with `microphone:` |
 | Cannot reach server | `ping <server>` — check network and firewall rules (Pexip uses TCP 443 and UDP 3478/3479) |
 | Wrong PIN | Edit `/etc/previs-client/config.yaml` and restart the service |
 | `dpkg-dev : Depends: bzip2 but it is not installable` during install | The image has an incomplete apt configuration (the `-updates` pocket and/or the `universe` component is missing). The installer now enables them automatically; if it still fails, check `/etc/apt/sources.list` and `/etc/apt/sources.list.d/`, then run `sudo apt-get update && sudo apt-get -f install` |

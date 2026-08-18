@@ -23,9 +23,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
+#include <cctype>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <sys/stat.h>
 
@@ -43,6 +46,13 @@ struct Config {
     std::string display_name  = "Raspberry Pi Client";
     std::string pin;
     int         reconnect_delay_seconds = 10;
+
+    // Optional device pinning.  When set, only devices whose name contains the
+    // string (case insensitive) are considered for that role; otherwise the
+    // client picks the first device that looks usable.
+    std::string camera;
+    std::string microphone;
+    std::string speaker;
 };
 
 static Config load_config(const char * path)
@@ -57,6 +67,9 @@ static Config load_config(const char * path)
         if (doc["pin"])          cfg.pin          = doc["pin"].as<std::string>();
         if (doc["reconnect_delay_seconds"])
             cfg.reconnect_delay_seconds = doc["reconnect_delay_seconds"].as<int>();
+        if (doc["camera"])     cfg.camera     = doc["camera"].as<std::string>();
+        if (doc["microphone"]) cfg.microphone = doc["microphone"].as<std::string>();
+        if (doc["speaker"])    cfg.speaker    = doc["speaker"].as<std::string>();
     } catch (const YAML::Exception & e) {
         std::fprintf(stderr, "[config] Failed to parse %s: %s\n", path, e.what());
         std::exit(1);
@@ -244,66 +257,178 @@ static void install_callbacks(AppState & app)
 
 // Report how many devices the SDK found, and log their names.  Returns the
 // device count, or -1 when the list could not be read at all.
-static int list_devices(AppState & app, const char * label,
-                        PulseMediaType type, PulseMediaDirection direction)
+struct DeviceInfo {
+    PulseDeviceID id = 0;
+    std::string   name;
+    bool          is_default = false;
+};
+
+static std::string to_lower(std::string s)
 {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return s;
+}
+
+static bool name_contains(const std::string & haystack, const std::string & needle)
+{
+    if (needle.empty()) return false;
+    return to_lower(haystack).find(to_lower(needle)) != std::string::npos;
+}
+
+// List the devices of one class, logging each one.  Returns false when the
+// list could not be read at all (the vector is then left empty).
+static bool list_devices(AppState & app, const char * label,
+                         PulseMediaType type, PulseMediaDirection direction,
+                         std::vector<DeviceInfo> & out)
+{
+    out.clear();
+
     PulseDeviceIterator * it = nullptr;
     PulseError err = pulse_device_iterator_new(app.pulse, type, direction, &it);
     if (err != PULSE_SUCCESS || !it) {
         std::fprintf(stderr, "[client] Could not list %s devices: %s\n",
                      label, pulse_strerror(err));
         if (it) pulse_device_iterator_free(it);
-        return -1;
+        return false;
     }
 
-    int count = pulse_device_iterator_item_count(it);
     for (const PulseDevice * dev = pulse_device_iterator_first(it);
          dev != nullptr;
          dev = pulse_device_iterator_next(it)) {
+        DeviceInfo info;
         const char * name = pulse_device_get_name(dev);
-        std::printf("[client]   %s: %s%s\n", label, name ? name : "(unnamed)",
-                    pulse_device_is_system_default(dev) ? "  (default)" : "");
+        info.id         = pulse_device_get_id(dev);
+        info.name       = name ? name : "";
+        info.is_default = pulse_device_is_system_default(dev);
+        out.push_back(info);
+
+        std::printf("[client]   %s: %s%s\n", label,
+                    info.name.empty() ? "(unnamed)" : info.name.c_str(),
+                    info.is_default ? "  (default)" : "");
     }
     std::fflush(stdout);
 
     pulse_device_iterator_free(it);
-    return count;
+    return true;
 }
 
-static void connect_default_devices(AppState & app)
+// Devices the SDK enumerates but which cannot be used as a capture source.
+//
+//  * PulseAudio exposes a ".monitor" source for every sink ("Monitor of ...").
+//    Those are loopbacks of what is being played back, not microphones, and on
+//    a machine with no real capture device one of them ends up being the
+//    "system default" source — attaching it made the media backend crash with
+//    SIGSEGV instead of returning an error.
+//  * On a Raspberry Pi, /dev/video* also carries the ISP, encoder and
+//    "unicam"/"pispbe" memory-to-memory nodes.  They are not cameras; the SDK
+//    lists them but attaching one only fails ("Generic failure") after a long
+//    timeout, which is why a connected USB camera never got used.
+static bool is_unusable_device(const std::string & name, PulseMediaType type,
+                               PulseMediaDirection direction)
+{
+    const std::string lower = to_lower(name);
+
+    if (type == PULSE_MEDIA_AUDIO && direction == PULSE_MEDIA_INPUT)
+        return lower.rfind("monitor of ", 0) == 0
+            || lower.find(".monitor") != std::string::npos;
+
+    if (type == PULSE_MEDIA_VIDEO) {
+        static const char * const blocked[] = {
+            "bcm2835-isp", "bcm2835-codec", "pispbe", "rpivid",
+            "unicam-image", "rp1-cfe",
+        };
+        for (const char * b : blocked)
+            if (lower.find(b) != std::string::npos) return true;
+    }
+
+    return false;
+}
+
+// Pick, in order of preference, the devices worth trying for one role.
+static std::vector<DeviceInfo> rank_candidates(const std::vector<DeviceInfo> & devices,
+                                               const std::string & preferred,
+                                               PulseMediaType type,
+                                               PulseMediaDirection direction)
+{
+    std::vector<DeviceInfo> candidates;
+
+    // 1. Anything the operator pinned in config.yaml — even a monitor source,
+    //    since asking for it explicitly is a deliberate choice.
+    if (!preferred.empty())
+        for (const auto & d : devices)
+            if (name_contains(d.name, preferred)) candidates.push_back(d);
+
+    if (!preferred.empty() && candidates.empty())
+        std::fprintf(stderr,
+                     "[client] No device matches \"%s\" — falling back to"
+                     " auto-detection.\n", preferred.c_str());
+
+    if (!candidates.empty()) return candidates;
+
+    // 2. The system default, when it is a device we can actually use.
+    for (const auto & d : devices)
+        if (d.is_default && !is_unusable_device(d.name, type, direction))
+            candidates.push_back(d);
+
+    // 3. Every other usable device, so a USB camera is still found when the
+    //    default is one of the Pi's internal video nodes.
+    for (const auto & d : devices)
+        if (!d.is_default && !is_unusable_device(d.name, type, direction))
+            candidates.push_back(d);
+
+    return candidates;
+}
+
+static void connect_default_devices(AppState & app, const Config & cfg)
 {
     struct Binding {
         const char *        name;
         PulseMediaType      type;
         PulseMediaDirection direction;
+        const std::string * preferred;
     };
     const Binding bindings[] = {
-        { "camera",      PULSE_MEDIA_VIDEO, PULSE_MEDIA_INPUT  },
-        { "microphone",  PULSE_MEDIA_AUDIO, PULSE_MEDIA_INPUT  },
-        { "speaker",     PULSE_MEDIA_AUDIO, PULSE_MEDIA_OUTPUT },
+        { "camera",      PULSE_MEDIA_VIDEO, PULSE_MEDIA_INPUT,  &cfg.camera     },
+        { "microphone",  PULSE_MEDIA_AUDIO, PULSE_MEDIA_INPUT,  &cfg.microphone },
+        { "speaker",     PULSE_MEDIA_AUDIO, PULSE_MEDIA_OUTPUT, &cfg.speaker    },
     };
 
     int audio_failures = 0;
     for (const auto & b : bindings) {
-        // Only bind a device class the SDK actually enumerated.  Asking it for
-        // the "system default" of an empty class makes the media backend walk
-        // a device it never opened, which has been seen to abort the process
-        // with SIGSEGV on machines without a working sound server.
-        int count = list_devices(app, b.name, b.type, b.direction);
-        if (count <= 0) {
-            std::fprintf(stderr, "[client] No %s device available — skipping.\n",
+        std::vector<DeviceInfo> devices;
+        list_devices(app, b.name, b.type, b.direction, devices);
+
+        // Only bind a device the SDK actually enumerated *and* that can serve
+        // this role.  Asking it for the "system default" of an empty (or
+        // monitor-only) class makes the media backend walk a device it never
+        // opened, which aborts the process with SIGSEGV.
+        std::vector<DeviceInfo> candidates =
+            rank_candidates(devices, *b.preferred, b.type, b.direction);
+        if (candidates.empty()) {
+            std::fprintf(stderr, "[client] No usable %s device — skipping.\n",
                          b.name);
             if (b.type == PULSE_MEDIA_AUDIO) ++audio_failures;
             continue;
         }
 
-        PulseError err = pulse_device_session_connect_system_default(
-            app.pulse, PULSE_MEDIA_CONTENT_MAIN, b.type, b.direction);
-        if (err != PULSE_SUCCESS) {
-            std::fprintf(stderr, "[client] Failed to attach default %s: %s\n",
-                         b.name, pulse_strerror(err));
-            if (b.type == PULSE_MEDIA_AUDIO) ++audio_failures;
+        bool attached = false;
+        for (const auto & dev : candidates) {
+            PulseError err = pulse_device_session_connect_device_by_id(
+                app.pulse, dev.id, b.type, b.direction, PULSE_MEDIA_CONTENT_MAIN);
+            if (err == PULSE_SUCCESS) {
+                std::printf("[client] Using %s: %s\n", b.name, dev.name.c_str());
+                std::fflush(stdout);
+                attached = true;
+                break;
+            }
+            std::fprintf(stderr, "[client] Failed to attach %s \"%s\": %s\n",
+                         b.name, dev.name.c_str(), pulse_strerror(err));
         }
+
+        // A missing camera or microphone must not stop the client from dialling
+        // in: a receive-only participant is far more useful than no call.
+        if (!attached && b.type == PULSE_MEDIA_AUDIO) ++audio_failures;
     }
 
     // The Pulse SDK talks to a PulseAudio server.  When the client runs as a
@@ -315,7 +440,8 @@ static void connect_default_devices(AppState & app)
     if (audio_failures > 0) {
         const char * server = std::getenv("PULSE_SERVER");
         std::fprintf(stderr,
-                     "[client] No usable audio device (PULSE_SERVER=%s).\n"
+                     "[client] Continuing without some audio devices"
+                     " (PULSE_SERVER=%s).\n"
                      "[client] Check that the sound server is running:\n"
                      "[client]   systemctl status previs-pulseaudio\n",
                      server ? server : "<unset>");
@@ -423,7 +549,7 @@ int main(int argc, char * argv[])
     }
 
     install_callbacks(app);
-    connect_default_devices(app);
+    connect_default_devices(app, cfg);
 
     // -----------------------------------------------------------------------
     //  Main loop: connect → stay connected → reconnect on drop

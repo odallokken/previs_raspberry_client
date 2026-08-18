@@ -38,6 +38,16 @@ StateDirectory=previs-client
 Environment="HOME=/var/lib/previs-client"
 Environment="XDG_CONFIG_HOME=/var/lib/previs-client/.config"
 
+# The Pulse SDK's media backend also links against libpipewire.  When it cannot
+# find PipeWire's client configuration it logs
+#
+#     pw.conf: can't load config client.conf: No such file or directory
+#
+# and then dereferences the context it failed to create, which crashes the
+# client with SIGSEGV.  Point it at the system-wide configuration installed by
+# the PipeWire packages (scripts/install.sh makes sure they are present).
+Environment="PIPEWIRE_CONFIG_DIR=/usr/share/pipewire"
+
 ExecStart=/usr/local/bin/previs-client /etc/previs-client/config.yaml
 
 # Restart automatically if the process exits unexpectedly.

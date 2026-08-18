@@ -484,6 +484,18 @@ if [[ -f /etc/pulse/client.conf ]] && ! grep -q "^autospawn" /etc/pulse/client.c
         >> /etc/pulse/client.conf
 fi
 
+# The Pulse SDK's media backend links against libpipewire, which refuses to
+# start without its configuration ("pw.conf: can't load config client.conf")
+# and then crashes the client.  The configuration lives in
+# libpipewire-0.3-common, which is only a recommendation of the runtime library,
+# so make sure it is installed.
+if [[ ! -f /usr/share/pipewire/client.conf ]]; then
+    info "Installing PipeWire configuration needed by the Pulse SDK..."
+    apt-get install -y libpipewire-0.3-common \
+        || warning "Could not install libpipewire-0.3-common — the Pulse SDK may" \
+                   "log 'pw.conf: can't load config client.conf'."
+fi
+
 # ---------------------------------------------------------------------------
 # 5. System user
 # ---------------------------------------------------------------------------
