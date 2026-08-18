@@ -120,9 +120,12 @@ This will:
 3. Build the `previs-client` binary from source.
 4. Install the binary to `/usr/local/bin/previs-client`.
 5. Copy `config.yaml` to `/etc/previs-client/config.yaml`.
-6. Install the systemd service unit to `/etc/systemd/system/`.
-7. Create a dedicated `previs` system user.
-8. Enable and start the `previs-client` service.
+6. Install the systemd service units to `/etc/systemd/system/`
+   (`previs-client.service` plus `previs-pulseaudio.service`, a system-wide
+   PulseAudio daemon — see [Audio: why a system-wide PulseAudio](#audio-why-a-system-wide-pulseaudio)).
+7. Create a dedicated `previs` system user and add it to the `audio`, `video`
+   and `pulse-access` groups.
+8. Enable and start the `previs-pulseaudio` and `previs-client` services.
 
 ---
 
@@ -214,6 +217,38 @@ sudo systemctl enable previs-client
 The client is entirely headless — no display, no GUI. Video and audio flow
 through the Pexip Pulse SDK using the system's default V4L2 camera and ALSA/
 PulseAudio devices.
+
+### Audio: why a system-wide PulseAudio
+
+The Pulse SDK's audio backend talks to a PulseAudio server. PulseAudio normally
+runs once per *login session*, but `previs-client` runs as the `previs` system
+user, which never logs in — so there is no session, no `XDG_RUNTIME_DIR` and no
+sound server to connect to. The symptom is a restart loop logging:
+
+```
+[pulse:pulse] Failed to connect: Connection refused
+[pulse:alsa] failed to detect PCM formats
+[pulse:alsa] Got no caps from device: hw:1,0
+[pulse:pulse] Failed to connect: Invalid argument
+```
+
+(The SDK first tries PulseAudio, then falls back to raw ALSA, which usually
+fails too because the devices are busy or expose no usable format.)
+
+The installer therefore sets up `previs-pulseaudio.service`, a system-wide
+PulseAudio daemon that runs without a session, and `previs-client.service`
+points the SDK at it with `PULSE_SERVER=unix:/run/pulse/native`. The `previs`
+user is added to `pulse-access` so it is allowed to connect.
+
+```bash
+sudo systemctl status previs-pulseaudio
+sudo -u previs PULSE_SERVER=unix:/run/pulse/native pactl info   # should list sinks/sources
+```
+
+If the machine uses PipeWire instead of PulseAudio, disable the PipeWire
+services (`systemctl --global disable pipewire pipewire-pulse wireplumber`) or
+keep them and point `PULSE_SERVER` at PipeWire's socket instead — the two must
+not both own the sound devices.
 
 ---
 
@@ -378,7 +413,8 @@ previs_raspberry_client/
 │   │   └── armpl_compat.c       Arm Performance Libraries replacement (arm64)
 │   └── debs/                    Optional local Pulse SDK .deb packages (git-ignored)
 ├── systemd/
-│   └── previs-client.service    systemd unit file
+│   ├── previs-client.service    systemd unit file
+│   └── previs-pulseaudio.service  system-wide PulseAudio daemon unit
 └── scripts/
     └── install.sh               One-shot installer script
 ```
@@ -392,6 +428,8 @@ previs_raspberry_client/
 | Service fails to start | `sudo journalctl -xe -u previs-client` for the full error |
 | Camera not found | `ls /dev/video*` — ensure the camera is connected; `v4l2-ctl --list-devices` |
 | No audio | `aplay -l` to list playback devices; `arecord -l` to list capture devices |
+| `[pulse:pulse] Failed to connect: Connection refused` and a restart loop | No sound server for the headless `previs` user. Check `sudo systemctl status previs-pulseaudio` and that `previs` is in the `pulse-access` group (`id previs`) — see [Audio: why a system-wide PulseAudio](#audio-why-a-system-wide-pulseaudio) |
+| `[pulse:alsa] Could not open device hw:X,0` | Another process (a desktop PulseAudio/PipeWire instance) already owns the device. Stop it, or leave device handling to `previs-pulseaudio` only |
 | Cannot reach server | `ping <server>` — check network and firewall rules (Pexip uses TCP 443 and UDP 3478/3479) |
 | Wrong PIN | Edit `/etc/previs-client/config.yaml` and restart the service |
 | `dpkg-dev : Depends: bzip2 but it is not installable` during install | The image has an incomplete apt configuration (the `-updates` pocket and/or the `universe` component is missing). The installer now enables them automatically; if it still fails, check `/etc/apt/sources.list` and `/etc/apt/sources.list.d/`, then run `sudo apt-get update && sudo apt-get -f install` |

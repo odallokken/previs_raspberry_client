@@ -21,6 +21,7 @@
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -193,13 +194,29 @@ static void connect_default_devices(AppState & app)
         { "speaker",     PULSE_MEDIA_AUDIO, PULSE_MEDIA_OUTPUT },
     };
 
+    int audio_failures = 0;
     for (const auto & b : bindings) {
         PulseError err = pulse_device_session_connect_system_default(
             app.pulse, PULSE_MEDIA_CONTENT_MAIN, b.type, b.direction);
         if (err != PULSE_SUCCESS) {
-            std::fprintf(stderr, "[pulse] Failed to attach default %s: %s\n",
+            std::fprintf(stderr, "[client] Failed to attach default %s: %s\n",
                          b.name, pulse_strerror(err));
+            if (b.type == PULSE_MEDIA_AUDIO) ++audio_failures;
         }
+    }
+
+    // The Pulse SDK talks to a PulseAudio server.  When the client runs as a
+    // headless system user there is no per-user daemon, so a system-wide one
+    // must be running and PULSE_SERVER must point at its socket — otherwise
+    // the SDK logs "Failed to connect: Connection refused" and falls back to
+    // raw ALSA, which normally cannot open the devices either.
+    if (audio_failures > 0) {
+        const char * server = std::getenv("PULSE_SERVER");
+        std::fprintf(stderr,
+                     "[client] No usable audio device (PULSE_SERVER=%s).\n"
+                     "[client] Check that the sound server is running:\n"
+                     "[client]   systemctl status previs-pulseaudio\n",
+                     server ? server : "<unset>");
     }
 }
 
@@ -270,6 +287,13 @@ static void do_disconnect(AppState & app)
 
 int main(int argc, char * argv[])
 {
+    // systemd captures stdout through a pipe, which makes it fully buffered:
+    // without this the client's own messages only reach the journal in large
+    // chunks (or not at all if the process is killed), leaving just the Pulse
+    // SDK's stderr output visible.
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+
     const char * config_path = "/etc/previs-client/config.yaml";
     if (argc > 1) config_path = argv[1];
 
