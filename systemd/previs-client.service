@@ -8,7 +8,19 @@ Wants=network-online.target
 # running, so the client is only started once the whole PipeWire stack is up.
 # previs-client additionally waits for both sockets itself before touching any
 # device, so a manually started client behaves the same.
-Requires=previs-pipewire.service previs-wireplumber.service previs-pipewire-pulse.service
+#
+# 'Wants=' rather than 'Requires=' on purpose: all three sound units run with
+# 'Restart=always', and with 'Requires=' every one of those restarts is a stop
+# that propagates here and takes the client down with it —
+#
+#     previs-wireplumber.service: Scheduled restart job, restart counter is at 1.
+#     Stopping previs-client.service - Previs Pexip Video Client...
+#
+# which turns a single flapping dependency into a permanent restart loop.  The
+# ordering above still starts the client last, and previs-client copes with a
+# missing sound server on its own: it waits for the sockets and joins the call
+# video-only when the audio stack never appears.
+Wants=previs-pipewire.service previs-wireplumber.service previs-pipewire-pulse.service
 
 [Service]
 Type=simple

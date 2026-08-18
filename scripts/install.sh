@@ -141,6 +141,7 @@ if ! apt-get install -y \
     pipewire pipewire-pulse wireplumber \
     libpipewire-0.3-0 libpipewire-0.3-common libpipewire-0.3-modules \
     libspa-0.2-modules \
+    dbus-bin \
     pulseaudio-utils alsa-utils \
     v4l-utils \
     network-manager
@@ -481,6 +482,21 @@ chmod 644 /etc/systemd/system/previs-client.service
 # a PipeWire daemon, a session manager and a PulseAudio-compatible front end,
 # all running as the 'previs' user.
 info "Installing PipeWire services for previs-client..."
+
+# previs-wireplumber.service runs WirePlumber under 'dbus-run-session', because
+# WirePlumber aborts with "Cannot autolaunch D-Bus without X11 $DISPLAY" when it
+# cannot reach a session bus — and a headless system user has none.  Without a
+# session manager no sound card ever becomes a PipeWire node, so the SDK only
+# ever sees "Dummy Output".  The helper comes from the 'dbus-bin' package
+# installed above; stop here rather than enable a unit that cannot start.
+if [[ ! -x /usr/bin/dbus-run-session ]]; then
+    error "/usr/bin/dbus-run-session is missing." \
+          "previs-wireplumber.service needs it to give WirePlumber a private" \
+          "D-Bus session bus; without it WirePlumber crash-loops and no" \
+          "microphone or speaker is ever detected." \
+          "Install it with: sudo apt-get install dbus-bin"
+fi
+
 for unit in previs-pipewire.service previs-wireplumber.service \
             previs-pipewire-pulse.service; do
     install -m 644 "${REPO_DIR}/systemd/${unit}" "/etc/systemd/system/${unit}"

@@ -1,8 +1,13 @@
 # Previs Raspberry Pi Client
 
 A headless [Pexip Infinity](https://www.pexip.com/) video client for the
-**Raspberry Pi 4**, built on the
+**Raspberry Pi 5**, built on the
 [Pexip Pulse SDK](https://github.com/pexip/doppler).
+
+> **Raspberry Pi 4 is not supported.** The arm64 Pulse SDK uses ARMv8.2-A
+> instructions that the Pi 4's Cortex-A72 cannot execute, so the client dies
+> with `SIGILL` on the first camera frame. See
+> [CPU requirements: the arm64 SDK needs ARMv8.2-A](#cpu-requirements-the-arm64-sdk-needs-armv82-a).
 
 When the Raspberry Pi boots, the client automatically dials into the Virtual
 Meeting Room (VMR) defined in `config.yaml` and stays there, reconnecting
@@ -14,12 +19,81 @@ whenever the call drops.
 
 | Item | Details |
 |------|---------|
-| Raspberry Pi 4 | Model B, 2 GB RAM or more |
+| Raspberry Pi 5 | Model B, 2 GB RAM or more. **A Raspberry Pi 4 does not work with the current arm64 SDK** — see [CPU requirements: the arm64 SDK needs ARMv8.2-A](#cpu-requirements-the-arm64-sdk-needs-armv82-a) |
 | MicroSD card | 16 GB or larger (Class 10 / A1 recommended) |
 | USB camera | Any V4L2-compatible webcam (e.g. Logitech C920) |
 | USB headset or speaker/mic | Any ALSA-compatible audio device |
 | HDMI display | Optional — the client is headless but useful for debugging |
 | Network | Ethernet (recommended) or Wi-Fi |
+
+---
+
+## CPU requirements: the arm64 SDK needs ARMv8.2-A
+
+The arm64 build of the Pexip Pulse SDK contains instructions that a
+**Raspberry Pi 4 cannot execute**. Its Cortex-A72 is a plain ARMv8.0-A core,
+while the SDK's video colour converter uses ARMv8.2-A extensions. The first
+camera frame therefore kills the process with `SIGILL`:
+
+```
+previs-client.service: Main process exited, code=dumped, status=4/ILL
+```
+
+```
+Thread 29 "videosrc_8:src" received signal SIGILL, Illegal instruction.
+#0  0x0000fffff6db5aec in ?? ()                from /opt/pexninja/lib/libpexpulse.so
+#1  0x0000fffff6db4c8c in pex_v_convert_frame () from /opt/pexninja/lib/libpexpulse.so
+...
+#29 gst_video_decoder_finish_frame ()          from /opt/pexninja/lib/libpexlgpl.so
+```
+
+The crash happens immediately after `[client] Using camera: ...`, is fully
+reproducible, and no configuration change avoids it — the instruction simply
+does not exist on the CPU.
+
+Check what your machine supports:
+
+```bash
+lscpu | grep 'Model name'
+grep -m1 Features /proc/cpuinfo
+```
+
+A Raspberry Pi 4 reports the ARMv8.0-A baseline and nothing else:
+
+```
+Model name: Cortex-A72
+Features  : fp asimd evtstrm crc32 cpuid
+```
+
+A Raspberry Pi 5 (Cortex-A76, ARMv8.2-A) additionally lists `asimdhp`,
+`asimdrdm`, `asimddp`, `lrcpc` and friends. **If `asimdhp` and `asimddp` are
+missing, the SDK will crash with `SIGILL` on this machine.**
+
+To confirm a `SIGILL` is really an unsupported opcode rather than corruption,
+disassemble the faulting instruction from the core dump:
+
+```bash
+sudo coredumpctl gdb previs-client
+(gdb) x/4i $pc
+(gdb) info registers pc
+```
+
+An ARMv8.2-A instruction (`udot`, `bfdot`, `smmla`, `fcvtl2` on fp16, ...) or a
+`(bad)` from gdb confirms the diagnosis.
+
+**Options:**
+
+1. **Run on a Raspberry Pi 5.** The rest of the stack is unchanged and already
+   works; this is the only fix that lives entirely in your hands.
+2. **Ask Pexip for an ARMv8.0-A build** of the `pexninja` arm64 package, or for
+   the documented minimum architecture. If the SDK officially targets
+   ARMv8.2-A, the Pi 4 cannot be supported no matter what this repository does.
+3. **Ask Pexip whether the optimised converter can be disabled** at runtime.
+   Some builds honour an environment variable that forces the scalar path;
+   there is no such option in the public `pexpulse/pulse.h`.
+
+Everything else in this repository — device selection, the PipeWire stack, the
+systemd units — is independent of this limitation and works on both boards.
 
 ---
 
@@ -280,6 +354,36 @@ itself** and sharing the runtime directory `/run/previs-client`:
 | `previs-wireplumber.service` | the session manager that turns ALSA cards and USB webcams into PipeWire nodes |
 | `previs-pipewire-pulse.service` | the PulseAudio-compatible socket `/run/previs-client/pulse/native` |
 
+WirePlumber needs a **D-Bus session bus** to reserve the sound cards. The
+headless `previs` user has none, and D-Bus refuses to autolaunch one without an
+X11 session, so WirePlumber used to abort during start-up:
+
+```
+wireplumber: Error acquiring bus address: Cannot autolaunch D-Bus without X11 $DISPLAY
+previs-wireplumber.service: Main process exited, code=exited, status=70/SOFTWARE
+```
+
+systemd then restarted it every few seconds, and because no session manager
+ever stayed up long enough to turn the sound cards into nodes, the only devices
+the SDK could see were `Dummy Output` and `Monitor of Dummy Output`.
+`previs-wireplumber.service` therefore runs it as
+`dbus-run-session -- wireplumber`, which starts a private bus for WirePlumber
+alone and tears it down again on exit. The helper comes from the `dbus-bin`
+package, which the installer installs and checks for.
+
+`previs-client.service` only **wants** the three sound units, it does not
+*require* them. All three run with `Restart=always`, and with `Requires=` every
+restart propagated down and stopped the client too, turning one flapping unit
+into a permanent restart loop:
+
+```
+previs-wireplumber.service: Scheduled restart job, restart counter is at 1.
+Stopping previs-client.service - Previs Pexip Video Client...
+```
+
+The `After=` ordering still starts the client last, and the client copes with a
+missing sound server on its own — see below.
+
 `previs-client.service` points the SDK at them with
 `PULSE_SERVER=unix:/run/previs-client/pulse/native` and
 `XDG_RUNTIME_DIR=/run/previs-client`. Plain PulseAudio is *not* used any more:
@@ -483,6 +587,10 @@ previs_raspberry_client/
 | Problem | Check |
 |---------|-------|
 | Service fails to start | `sudo journalctl -xe -u previs-client` for the full error |
+| `Main process exited, code=dumped, status=4/ILL` right after `Using camera: ...` | The CPU cannot execute the SDK's video converter. On a Raspberry Pi 4 this is fatal and unfixable here — see [CPU requirements: the arm64 SDK needs ARMv8.2-A](#cpu-requirements-the-arm64-sdk-needs-armv82-a) |
+| `wireplumber: Cannot autolaunch D-Bus without X11 $DISPLAY` / `status=70/SOFTWARE` restart loop | WirePlumber has no D-Bus session bus. `previs-wireplumber.service` runs it under `dbus-run-session`; install the helper with `sudo apt-get install dbus-bin` and re-run `sudo bash scripts/install.sh` |
+| Only `Dummy Output` and `Monitor of Dummy Output` are listed | WirePlumber is not running, so no real sound card became a PipeWire node. Check `sudo systemctl status previs-wireplumber` — most often the D-Bus problem above |
+| `Stopping previs-client.service` with no error from the client itself | A required unit restarted and took the client with it. The units now use `Wants=` instead of `Requires=`; re-run the installer to pick up the fix, then look for whichever `previs-*` unit is flapping |
 | Camera not found | `ls /dev/video*` — ensure the camera is connected; `v4l2-ctl --list-devices` |
 | No audio | `aplay -l` to list playback devices; `arecord -l` to list capture devices |
 | `[pulse:pulse] Failed to connect: Connection refused` | No PulseAudio-compatible server for the headless `previs` user. Check `sudo systemctl status previs-pipewire-pulse` — see [Audio: why a dedicated PipeWire stack](#audio-why-a-dedicated-pipewire-stack) |

@@ -24,7 +24,25 @@ Environment="HOME=/var/lib/previs-client"
 Environment="XDG_CONFIG_HOME=/var/lib/previs-client/.config"
 Environment="XDG_STATE_HOME=/var/lib/previs-client/.local/state"
 
-ExecStart=/usr/bin/wireplumber
+# WirePlumber talks to a D-Bus session bus (for reservation of the ALSA cards
+# and for the portal/rt modules).  A headless system user has none, and D-Bus
+# cannot autolaunch one without an X11 session, so WirePlumber aborts during
+# start-up:
+#
+#     Failed to connect to session bus: Unable to autolaunch a dbus-daemon
+#         without a $DISPLAY for X11
+#     Error acquiring bus address: Cannot autolaunch D-Bus without X11 $DISPLAY
+#     previs-wireplumber.service: Main process exited, code=exited,
+#         status=70/SOFTWARE
+#
+# systemd then restarts it every few seconds, and because no session manager
+# ever stays up long enough to turn the sound cards into PipeWire nodes, the
+# only devices the SDK sees are "Dummy Output" and "Monitor of Dummy Output".
+#
+# 'dbus-run-session' starts a private bus, exports DBUS_SESSION_BUS_ADDRESS into
+# the child and tears the bus down again when WirePlumber exits.  It comes from
+# the 'dbus-bin' package, which scripts/install.sh installs.
+ExecStart=/usr/bin/dbus-run-session -- /usr/bin/wireplumber
 
 Restart=always
 RestartSec=2s
