@@ -138,7 +138,7 @@ if ! apt-get install -y \
     build-essential cmake git curl ca-certificates \
     libyaml-cpp-dev \
     libglfw3-dev libgl1-mesa-dev \
-    pulseaudio alsa-utils \
+    pulseaudio pulseaudio-utils alsa-utils \
     v4l-utils \
     network-manager
 then
@@ -470,17 +470,17 @@ sed -e "s|PEX_BASE_PATH=[^\"]*|PEX_BASE_PATH=${SDK_PREFIX}|" \
     > /etc/systemd/system/previs-client.service
 chmod 644 /etc/systemd/system/previs-client.service
 
-# previs-client runs as a headless system user, so there is no per-user
-# PulseAudio daemon for the Pulse SDK to talk to.  Install a system-wide one.
-info "Installing system-wide PulseAudio service..."
+# previs-client runs as a headless system user, so no PulseAudio daemon is
+# started for it automatically.  Install one that runs as the same user.
+info "Installing PulseAudio service for previs-client..."
 install -m 644 "${REPO_DIR}/systemd/previs-pulseaudio.service" \
     /etc/systemd/system/previs-pulseaudio.service
 
-# Stop the per-user daemon from being auto-spawned for the 'previs' user; it
-# would compete with the system-wide daemon for the sound devices.
+# Stop libpulse from auto-spawning a second daemon behind our back; the one
+# started by previs-pulseaudio.service owns the sound devices.
 mkdir -p /etc/pulse
 if [[ -f /etc/pulse/client.conf ]] && ! grep -q "^autospawn" /etc/pulse/client.conf; then
-    printf '\n# Added by previs-client installer: the system-wide daemon is used.\nautospawn = no\n' \
+    printf '\n# Added by previs-client installer: previs-pulseaudio.service is used.\nautospawn = no\n' \
         >> /etc/pulse/client.conf
 fi
 
@@ -489,26 +489,19 @@ fi
 # ---------------------------------------------------------------------------
 if ! id -u previs &>/dev/null; then
     info "Creating system user 'previs'..."
-    useradd -r -s /usr/sbin/nologin -G audio,video -c "Previs video client" previs
+    useradd -r -s /usr/sbin/nologin -G audio,video \
+        -d /var/lib/previs-client -c "Previs video client" previs
 else
     info "System user 'previs' already exists."
-    # Ensure group memberships.
+    # Ensure group memberships and the home directory the units expect.
     usermod -aG audio,video previs 2>/dev/null || true
+    usermod -d /var/lib/previs-client previs 2>/dev/null || true
 fi
 
-# 'pulse-access' is created by the pulseaudio package and is what the
-# system-wide PulseAudio daemon authorises its clients with.
-if getent group pulse-access >/dev/null; then
-    usermod -aG pulse-access previs 2>/dev/null || true
-else
-    warning "Group 'pulse-access' does not exist — is the 'pulseaudio' package installed?"
-fi
-
-# The PulseAudio daemon itself must be able to reach the sound and video
-# devices when it runs outside a login session.
-if getent passwd pulse >/dev/null; then
-    usermod -aG audio,video pulse 2>/dev/null || true
-fi
+# PulseAudio keeps its configuration and cookie in the user's home directory.
+mkdir -p /var/lib/previs-client
+chown previs:previs /var/lib/previs-client
+chmod 700 /var/lib/previs-client
 
 # ---------------------------------------------------------------------------
 # 6. Enable and start the services
@@ -516,10 +509,24 @@ fi
 info "Reloading systemd daemon..."
 systemctl daemon-reload
 
-info "Enabling system-wide PulseAudio service..."
+info "Enabling PulseAudio service..."
 systemctl enable previs-pulseaudio
-systemctl restart previs-pulseaudio || \
+if systemctl restart previs-pulseaudio; then
+    # Confirm the daemon really accepts connections; the Pulse SDK only reports
+    # this as "[pulse:pulse] Failed to connect: Connection refused".
+    if command -v pactl > /dev/null; then
+        if ! runuser -u previs -- env XDG_RUNTIME_DIR=/run/previs-client \
+                HOME=/var/lib/previs-client \
+                PULSE_SERVER=unix:/run/previs-client/pulse/native \
+                pactl info > /dev/null 2>&1; then
+            warning "The sound server is running but did not answer on" \
+                    "unix:/run/previs-client/pulse/native — check" \
+                    "'journalctl -u previs-pulseaudio'."
+        fi
+    fi
+else
     warning "previs-pulseaudio failed to start — check 'systemctl status previs-pulseaudio'."
+fi
 
 info "Enabling previs-client service (starts on boot)..."
 systemctl enable previs-client
