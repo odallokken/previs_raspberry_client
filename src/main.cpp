@@ -238,6 +238,71 @@ static bool wait_for_sound_server(const AppState & app, int timeout_seconds = 30
 }
 
 // ---------------------------------------------------------------------------
+//  PipeWire configuration
+// ---------------------------------------------------------------------------
+
+// The Pulse SDK's media backend links against libpipewire, and libpipewire
+// refuses to create a context when it finds no "client.conf":
+//
+//     pw.conf: error loading config '/usr/share/pipewire/client.conf'
+//     pw.conf: can't load config client.conf: No such file or directory
+//
+// The SDK then uses the context it failed to create, so the process dies with
+// SIGSEGV the moment a device is attached.  The file belongs to
+// libpipewire-0.3-common, which is only a *recommendation* of the runtime
+// library the SDK depends on and is therefore often missing.
+//
+// Find a directory that really contains client.conf and export it as
+// PIPEWIRE_CONFIG_DIR before the SDK is initialised; scripts/install.sh drops a
+// minimal fallback copy in the previs-client data directory for the case where
+// the distribution package cannot be installed.
+static bool file_exists(const std::string & path)
+{
+    struct stat st{};
+    return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static bool ensure_pipewire_config()
+{
+    std::vector<std::string> candidates;
+
+    const char * env = std::getenv("PIPEWIRE_CONFIG_DIR");
+    if (env && env[0]) candidates.emplace_back(env);
+
+    candidates.emplace_back("/usr/local/share/previs-client/pipewire");
+    candidates.emplace_back("/usr/share/previs-client/pipewire");
+    candidates.emplace_back("/etc/previs-client/pipewire");
+    candidates.emplace_back("/usr/share/pipewire");
+    candidates.emplace_back("/etc/pipewire");
+
+    for (const auto & dir : candidates) {
+        if (!file_exists(dir + "/client.conf")) continue;
+        if (!env || dir != env) {
+            setenv("PIPEWIRE_CONFIG_DIR", dir.c_str(), 1);
+            std::printf("[client] Using PipeWire configuration from %s\n",
+                        dir.c_str());
+            std::fflush(stdout);
+        }
+        return true;
+    }
+
+    std::string searched;
+    for (const auto & dir : candidates) {
+        if (!searched.empty()) searched += ", ";
+        searched += dir;
+    }
+
+    std::fprintf(stderr,
+                 "[client] No PipeWire client.conf found (looked in %s).\n"
+                 "[client] The Pulse SDK's media backend crashes without it, so"
+                 " no camera, microphone or speaker will be attached.\n"
+                 "[client] Install it with:  sudo apt-get install"
+                 " libpipewire-0.3-common\n",
+                 searched.c_str());
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 //  Pulse helpers
 // ---------------------------------------------------------------------------
 
@@ -540,6 +605,7 @@ int main(int argc, char * argv[])
     // Must happen before pulse_new(): the SDK initialises its audio backend
     // while creating the instance.
     wait_for_sound_server(app);
+    const bool have_pipewire_config = ensure_pipewire_config();
 
     // Create and configure the Pulse instance.
     app.pulse = pulse_new();
@@ -549,7 +615,13 @@ int main(int argc, char * argv[])
     }
 
     install_callbacks(app);
-    connect_default_devices(app, cfg);
+    if (have_pipewire_config) {
+        connect_default_devices(app, cfg);
+    } else {
+        std::fprintf(stderr,
+                     "[client] Skipping device setup — see the PipeWire"
+                     " configuration warning above.\n");
+    }
 
     // -----------------------------------------------------------------------
     //  Main loop: connect → stay connected → reconnect on drop
