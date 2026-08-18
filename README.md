@@ -65,9 +65,23 @@ cd previs_raspberry_client
 
 ## 4. Edit the configuration
 
+Edit the `config.yaml` that sits in the repository you just cloned — that is
+the directory you are already in after step 3 (for example
+`~/previs_raspberry_client/config.yaml`):
+
 ```bash
+cd ~/previs_raspberry_client   # the clone from step 3
 nano config.yaml
 ```
+
+> **Which `config.yaml`?** There are two copies once the installer has run:
+> the one in the cloned repository is the template you edit *before* the
+> installation, and `/etc/previs-client/config.yaml` is the live file the
+> service actually reads. After installing, edit
+> `/etc/previs-client/config.yaml` (see
+> [Update the configuration](#update-the-configuration)) — changes to the
+> repository copy have no effect, and re-running the installer will not
+> overwrite an existing `/etc/previs-client/config.yaml`.
 
 | Key | Description | Example |
 |-----|-------------|---------|
@@ -139,6 +153,9 @@ You should see output similar to:
 ## Day-to-day operations
 
 ### Update the configuration
+
+The running service reads `/etc/previs-client/config.yaml`, **not** the copy in
+the cloned repository:
 
 ```bash
 sudo nano /etc/previs-client/config.yaml
