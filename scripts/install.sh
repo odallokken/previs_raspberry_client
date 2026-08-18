@@ -22,9 +22,11 @@
 #
 #       or by dropping them into <repo>/sdk/debs/.
 #    3. Builds the previs-client binary with CMake.
-#    4. Installs the binary, config file, and systemd service.
+#    4. Installs the binary, config file, and systemd services (the client plus
+#       a system-wide PulseAudio daemon, since the client runs headless with no
+#       login session of its own).
 #    5. Creates a dedicated 'previs' system user.
-#    6. Enables and starts the systemd service.
+#    6. Enables and starts the systemd services.
 #
 #  After installation, edit the configuration file and restart:
 #
@@ -468,6 +470,20 @@ sed -e "s|PEX_BASE_PATH=[^\"]*|PEX_BASE_PATH=${SDK_PREFIX}|" \
     > /etc/systemd/system/previs-client.service
 chmod 644 /etc/systemd/system/previs-client.service
 
+# previs-client runs as a headless system user, so there is no per-user
+# PulseAudio daemon for the Pulse SDK to talk to.  Install a system-wide one.
+info "Installing system-wide PulseAudio service..."
+install -m 644 "${REPO_DIR}/systemd/previs-pulseaudio.service" \
+    /etc/systemd/system/previs-pulseaudio.service
+
+# Stop the per-user daemon from being auto-spawned for the 'previs' user; it
+# would compete with the system-wide daemon for the sound devices.
+mkdir -p /etc/pulse
+if [[ -f /etc/pulse/client.conf ]] && ! grep -q "^autospawn" /etc/pulse/client.conf; then
+    printf '\n# Added by previs-client installer: the system-wide daemon is used.\nautospawn = no\n' \
+        >> /etc/pulse/client.conf
+fi
+
 # ---------------------------------------------------------------------------
 # 5. System user
 # ---------------------------------------------------------------------------
@@ -480,11 +496,30 @@ else
     usermod -aG audio,video previs 2>/dev/null || true
 fi
 
+# 'pulse-access' is created by the pulseaudio package and is what the
+# system-wide PulseAudio daemon authorises its clients with.
+if getent group pulse-access >/dev/null; then
+    usermod -aG pulse-access previs 2>/dev/null || true
+else
+    warning "Group 'pulse-access' does not exist — is the 'pulseaudio' package installed?"
+fi
+
+# The PulseAudio daemon itself must be able to reach the sound and video
+# devices when it runs outside a login session.
+if getent passwd pulse >/dev/null; then
+    usermod -aG audio,video pulse 2>/dev/null || true
+fi
+
 # ---------------------------------------------------------------------------
-# 6. Enable and start the service
+# 6. Enable and start the services
 # ---------------------------------------------------------------------------
 info "Reloading systemd daemon..."
 systemctl daemon-reload
+
+info "Enabling system-wide PulseAudio service..."
+systemctl enable previs-pulseaudio
+systemctl restart previs-pulseaudio || \
+    warning "previs-pulseaudio failed to start — check 'systemctl status previs-pulseaudio'."
 
 info "Enabling previs-client service (starts on boot)..."
 systemctl enable previs-client

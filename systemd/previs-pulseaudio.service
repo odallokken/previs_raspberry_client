@@ -1,0 +1,28 @@
+[Unit]
+Description=System-wide PulseAudio sound server (for previs-client)
+Documentation=https://github.com/odallokken/previs_raspberry_client
+# previs-client runs as a headless system user with no login session, so there
+# is no per-user PulseAudio daemon for it to talk to.  Without this unit the
+# Pulse SDK logs "[pulse:pulse] Failed to connect: Connection refused" and then
+# falls back to raw ALSA, which usually fails too ("Got no caps from device").
+After=sound.target
+Before=previs-client.service
+
+[Service]
+Type=notify
+# 'pulse' and the 'pulse-access' group are created by the pulseaudio package.
+User=pulse
+Group=pulse
+UMask=0002
+# --system     : run without a user session (headless).
+# --disallow-exit / --disallow-module-loading: keep the daemon alive and locked
+#                down, as recommended for system mode.
+ExecStart=/usr/bin/pulseaudio --system --disallow-exit --disallow-module-loading --exit-idle-time=-1 --log-target=journal
+Restart=on-failure
+RestartSec=5s
+RuntimeDirectory=pulse
+RuntimeDirectoryMode=0755
+SupplementaryGroups=audio video render
+
+[Install]
+WantedBy=multi-user.target

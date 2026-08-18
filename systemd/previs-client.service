@@ -1,8 +1,8 @@
 [Unit]
 Description=Previs Pexip Video Client
 Documentation=https://github.com/odallokken/previs_raspberry_client
-After=network-online.target sound.target
-Wants=network-online.target
+After=network-online.target sound.target previs-pulseaudio.service
+Wants=network-online.target previs-pulseaudio.service
 
 [Service]
 Type=simple
@@ -15,17 +15,28 @@ Group=previs
 Environment="PEX_BASE_PATH=/opt/pexninja"
 Environment="LD_LIBRARY_PATH=/opt/pexninja/lib"
 
+# The client runs as a headless system user with no login session, so there is
+# no per-user PulseAudio daemon and no XDG_RUNTIME_DIR.  Point the Pulse SDK at
+# the system-wide sound server started by previs-pulseaudio.service; without
+# this the SDK logs "Failed to connect: Connection refused" and falls back to
+# raw ALSA, which then fails to open the capture/playback devices.
+Environment="PULSE_SERVER=unix:/run/pulse/native"
+Environment="XDG_RUNTIME_DIR=/run/previs-client"
+RuntimeDirectory=previs-client
+RuntimeDirectoryMode=0700
+
 ExecStart=/usr/local/bin/previs-client /etc/previs-client/config.yaml
 
 # Restart automatically if the process exits unexpectedly.
-Restart=on-failure
+Restart=always
 RestartSec=10s
 
 # Give Pulse enough time to shut down gracefully on SIGTERM before SIGKILL.
 TimeoutStopSec=15s
 
-# Allow access to audio/video devices.
-SupplementaryGroups=audio video render
+# Allow access to audio/video devices.  'pulse-access' is what the system-wide
+# PulseAudio daemon grants clients access with.
+SupplementaryGroups=audio video render pulse-access
 
 [Install]
 WantedBy=multi-user.target
