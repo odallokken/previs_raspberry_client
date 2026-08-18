@@ -138,7 +138,10 @@ if ! apt-get install -y \
     build-essential cmake git curl ca-certificates \
     libyaml-cpp-dev \
     libglfw3-dev libgl1-mesa-dev \
-    pulseaudio pulseaudio-utils alsa-utils \
+    pipewire pipewire-pulse wireplumber \
+    libpipewire-0.3-0 libpipewire-0.3-common libpipewire-0.3-modules \
+    libspa-0.2-modules \
+    pulseaudio-utils alsa-utils \
     v4l-utils \
     network-manager
 then
@@ -470,17 +473,32 @@ sed -e "s|PEX_BASE_PATH=[^\"]*|PEX_BASE_PATH=${SDK_PREFIX}|" \
     > /etc/systemd/system/previs-client.service
 chmod 644 /etc/systemd/system/previs-client.service
 
-# previs-client runs as a headless system user, so no PulseAudio daemon is
-# started for it automatically.  Install one that runs as the same user.
-info "Installing PulseAudio service for previs-client..."
-install -m 644 "${REPO_DIR}/systemd/previs-pulseaudio.service" \
-    /etc/systemd/system/previs-pulseaudio.service
+# previs-client runs as a headless system user, so no sound server is started
+# for it automatically.  The Pexip SDK needs a full PipeWire stack: it builds
+# its audio pipeline out of GStreamer elements that talk to PipeWire directly
+# (pipewiresrc/pipewiresink), and creating one of those without a running
+# daemon crashes the client with SIGSEGV inside pw_context_connect().  Install
+# a PipeWire daemon, a session manager and a PulseAudio-compatible front end,
+# all running as the 'previs' user.
+info "Installing PipeWire services for previs-client..."
+for unit in previs-pipewire.service previs-wireplumber.service \
+            previs-pipewire-pulse.service; do
+    install -m 644 "${REPO_DIR}/systemd/${unit}" "/etc/systemd/system/${unit}"
+done
 
-# Stop libpulse from auto-spawning a second daemon behind our back; the one
-# started by previs-pulseaudio.service owns the sound devices.
+# Earlier versions of this installer ran plain PulseAudio instead.  It would now
+# fight with PipeWire over the sound cards, so retire it.
+if [[ -f /etc/systemd/system/previs-pulseaudio.service ]]; then
+    info "Removing the obsolete previs-pulseaudio service..."
+    systemctl disable --now previs-pulseaudio.service 2>/dev/null || true
+    rm -f /etc/systemd/system/previs-pulseaudio.service
+fi
+
+# Stop libpulse from auto-spawning a daemon behind our back; the pipewire-pulse
+# server started by previs-pipewire-pulse.service owns the sound devices.
 mkdir -p /etc/pulse
 if [[ -f /etc/pulse/client.conf ]] && ! grep -q "^autospawn" /etc/pulse/client.conf; then
-    printf '\n# Added by previs-client installer: previs-pulseaudio.service is used.\nautospawn = no\n' \
+    printf '\n# Added by previs-client installer: previs-pipewire-pulse.service is used.\nautospawn = no\n' \
         >> /etc/pulse/client.conf
 fi
 
@@ -531,11 +549,31 @@ chmod 700 /var/lib/previs-client
 info "Reloading systemd daemon..."
 systemctl daemon-reload
 
-info "Enabling PulseAudio service..."
-systemctl enable previs-pulseaudio
-if systemctl restart previs-pulseaudio; then
-    # Confirm the daemon really accepts connections; the Pulse SDK only reports
-    # this as "[pulse:pulse] Failed to connect: Connection refused".
+info "Enabling PipeWire services..."
+sound_ok=1
+for unit in previs-pipewire previs-wireplumber previs-pipewire-pulse; do
+    systemctl enable "${unit}"
+    if ! systemctl restart "${unit}"; then
+        warning "${unit} failed to start — check 'systemctl status ${unit}'."
+        sound_ok=0
+    fi
+done
+
+if (( sound_ok )); then
+    # Give the daemons a moment to create their sockets before probing them.
+    for _ in {1..30}; do
+        [[ -S /run/previs-client/pipewire-0 && -S /run/previs-client/pulse/native ]] && break
+        sleep 0.5
+    done
+
+    if [[ ! -S /run/previs-client/pipewire-0 ]]; then
+        warning "No PipeWire socket at /run/previs-client/pipewire-0 — the Pulse" \
+                "SDK cannot attach audio devices without it.  Check" \
+                "'journalctl -u previs-pipewire'."
+    fi
+
+    # Confirm the PulseAudio front end really accepts connections; the Pulse SDK
+    # only reports this as "[pulse:pulse] Failed to connect: Connection refused".
     if command -v pactl > /dev/null; then
         if ! runuser -u previs -- env XDG_RUNTIME_DIR=/run/previs-client \
                 HOME=/var/lib/previs-client \
@@ -543,11 +581,9 @@ if systemctl restart previs-pulseaudio; then
                 pactl info > /dev/null 2>&1; then
             warning "The sound server is running but did not answer on" \
                     "unix:/run/previs-client/pulse/native — check" \
-                    "'journalctl -u previs-pulseaudio'."
+                    "'journalctl -u previs-pipewire-pulse'."
         fi
     fi
-else
-    warning "previs-pulseaudio failed to start — check 'systemctl status previs-pulseaudio'."
 fi
 
 info "Enabling previs-client service (starts on boot)..."

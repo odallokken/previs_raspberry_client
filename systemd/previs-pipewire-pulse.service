@@ -1,0 +1,40 @@
+[Unit]
+Description=PipeWire PulseAudio server for previs-client
+Documentation=https://github.com/odallokken/previs_raspberry_client
+# The Pulse SDK *enumerates* devices through libpulse, so it also needs a
+# PulseAudio-compatible server.  pipewire-pulse provides one on top of the same
+# PipeWire graph the SDK's GStreamer elements use, which plain PulseAudio
+# cannot do — running both would make the two fight over the sound cards.
+#
+# The socket ends up at $XDG_RUNTIME_DIR/pulse/native, i.e. exactly the
+# PULSE_SERVER path previs-client.service points at.
+After=previs-pipewire.service previs-wireplumber.service
+Requires=previs-pipewire.service
+Before=previs-client.service
+
+[Service]
+Type=simple
+User=previs
+Group=previs
+UMask=0077
+
+RuntimeDirectory=previs-client
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+Environment="XDG_RUNTIME_DIR=/run/previs-client"
+Environment="PULSE_RUNTIME_PATH=/run/previs-client/pulse"
+
+StateDirectory=previs-client
+Environment="HOME=/var/lib/previs-client"
+Environment="XDG_CONFIG_HOME=/var/lib/previs-client/.config"
+Environment="XDG_STATE_HOME=/var/lib/previs-client/.local/state"
+
+ExecStart=/usr/bin/pipewire-pulse
+
+Restart=always
+RestartSec=2s
+
+SupplementaryGroups=audio video render
+
+[Install]
+WantedBy=multi-user.target
