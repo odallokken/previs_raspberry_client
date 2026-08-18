@@ -10,7 +10,13 @@
 #
 #  What this script does:
 #    1. Installs OS build dependencies and audio/video packages.
-#    2. Downloads and installs the Pexip Pulse SDK from the doppler repository.
+#    2. Installs the Pexip Pulse SDK .deb packages.  By default they are taken
+#       from the doppler repository, which only publishes amd64 builds; on a
+#       Raspberry Pi (arm64) supply your own packages instead:
+#
+#           sudo PULSE_DEB_DIR=/path/to/debs bash scripts/install.sh
+#
+#       or drop them into <repo>/sdk/debs/ and they are picked up automatically.
 #    3. Builds the previs-client binary with CMake.
 #    4. Installs the binary, config file, and systemd service.
 #    5. Creates a dedicated 'previs' system user.
@@ -126,28 +132,47 @@ then
 fi
 
 # ---------------------------------------------------------------------------
-# 2. Pexip Pulse SDK (.deb packages from the doppler repo)
+# 2. Pexip Pulse SDK (.deb packages)
 # ---------------------------------------------------------------------------
 if [[ -f "${SDK_PREFIX}/include/pexpulse/pulse.h" ]]; then
     info "Pulse SDK already installed at ${SDK_PREFIX} — skipping."
 else
-    info "Cloning doppler repository to get the Pulse SDK..."
-    rm -rf "${DOPPLER_DIR}"
-    git clone --depth 1 "${DOPPLER_REPO}" "${DOPPLER_DIR}"
+    DPKG_ARCH="$(dpkg --print-architecture)"
 
-    SDK_DEBS="${DOPPLER_DIR}/sdk/linux/debs"
-    if [[ ! -d "${SDK_DEBS}" ]]; then
-        error "Could not find sdk/linux/debs in the doppler repository. " \
-              "Check that the repo structure matches what is expected."
+    # Where do the .deb packages come from?  In order of preference:
+    #   1. PULSE_DEB_DIR   — a directory you already have the packages in.
+    #   2. <repo>/sdk/debs — packages committed alongside this repository.
+    #   3. The doppler repository (upstream; amd64 only at the time of writing).
+    #
+    # Pexip currently publishes the Pulse SDK for amd64 only, so on a Raspberry
+    # Pi (arm64) you have to supply arm64 packages yourself:
+    #
+    #     sudo PULSE_DEB_DIR=/path/to/debs bash scripts/install.sh
+    if [[ -n "${PULSE_DEB_DIR:-}" ]]; then
+        [[ -d "${PULSE_DEB_DIR}" ]] || error "PULSE_DEB_DIR '${PULSE_DEB_DIR}' is not a directory."
+        SDK_DEBS="${PULSE_DEB_DIR}"
+        info "Using Pulse SDK .deb packages from ${SDK_DEBS}"
+    elif compgen -G "${REPO_DIR}/sdk/debs/libpexpulse_*.deb" > /dev/null; then
+        SDK_DEBS="${REPO_DIR}/sdk/debs"
+        info "Using Pulse SDK .deb packages from ${SDK_DEBS}"
+    else
+        info "Cloning doppler repository to get the Pulse SDK..."
+        rm -rf "${DOPPLER_DIR}"
+        git clone --depth 1 "${DOPPLER_REPO}" "${DOPPLER_DIR}"
+
+        SDK_DEBS="${DOPPLER_DIR}/sdk/linux/debs"
+        if [[ ! -d "${SDK_DEBS}" ]]; then
+            error "Could not find sdk/linux/debs in the doppler repository. " \
+                  "Check that the repo structure matches what is expected."
+        fi
     fi
 
     info "Installing Pulse SDK .deb packages..."
-    DPKG_ARCH="$(dpkg --print-architecture)"
 
-    # The doppler repository ships packages for several architectures; pick the
-    # ones that match this machine (a Raspberry Pi running 64-bit Ubuntu is
-    # 'arm64').  Installing an 'amd64' package on arm64 fails with
-    # "package architecture (amd64) does not match system (arm64)".
+    # Pick the packages that match this machine's architecture (a Raspberry Pi
+    # running 64-bit Ubuntu is 'arm64').  Installing an 'amd64' package on
+    # arm64 fails with "package architecture (amd64) does not match system
+    # (arm64)".
     find_deb() {
         local pkg="$1" deb
         for deb in "${SDK_DEBS}/${pkg}"_*_"${DPKG_ARCH}".deb \
@@ -171,11 +196,11 @@ else
 
     if (( ${#MISSING_PACKAGES[@]} )); then
         AVAILABLE="$(ls "${SDK_DEBS}" 2>/dev/null | tr '\n' ' ')"
-        error "The Pulse SDK does not provide '${DPKG_ARCH}' packages for:" \
-              "${MISSING_PACKAGES[*]}." \
+        error "No '${DPKG_ARCH}' packages found for: ${MISSING_PACKAGES[*]}." \
               "Available files in ${SDK_DEBS}: ${AVAILABLE:-<none>}." \
-              "The Pexip Pulse SDK must be built or obtained for ${DPKG_ARCH}" \
-              "before this client can be installed on this machine."
+              "Pexip publishes the Pulse SDK for amd64 only, so on ${DPKG_ARCH}" \
+              "you must supply the packages yourself and point the installer at" \
+              "them:  sudo PULSE_DEB_DIR=/path/to/debs bash scripts/install.sh"
     fi
 
     dpkg -i "${SDK_PACKAGES[@]}" || true

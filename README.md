@@ -94,6 +94,25 @@ reconnect_delay_seconds: 10
 The installer script handles everything: SDK installation, build, system user
 creation, and systemd service setup.
 
+> **Raspberry Pi (arm64) users — read this first.** The public
+> [doppler](https://github.com/pexip/doppler) repository only publishes the
+> Pulse SDK for **amd64**. Those packages cannot be installed on a Pi
+> (`dpkg` reports *"package architecture (amd64) does not match system
+> (arm64)"*). Obtain the arm64 `libpexcommon`, `libpexpulse` and
+> `libpexpulse-dev` packages from Pexip, copy them onto the Pi, and point the
+> installer at them:
+>
+> ```bash
+> sudo PULSE_DEB_DIR=/home/previs/pulse-debs bash scripts/install.sh
+> ```
+>
+> Alternatively drop the `.deb` files into `sdk/debs/` inside this repository
+> and they are picked up automatically. **Do not commit them** — they are large
+> closed-source Pexip binaries, so `sdk/debs/.gitignore` deliberately excludes
+> them. To share them across several machines, host them somewhere your Pis can
+> reach (an internal file server, or a GitHub Release on a private repo, if your
+> licence with Pexip permits it) and download them before running the installer.
+
 ```bash
 sudo bash scripts/install.sh
 ```
@@ -101,8 +120,10 @@ sudo bash scripts/install.sh
 This will:
 1. Install build tools and media packages (`cmake`, `libyaml-cpp-dev`,
    `pulseaudio`, `alsa-utils`, `v4l-utils`, …).
-2. Clone the [doppler](https://github.com/pexip/doppler) repository to
-   download the Pexip Pulse SDK `.deb` packages and install them.
+2. Install the Pexip Pulse SDK `.deb` packages, taken from `PULSE_DEB_DIR`,
+   from `sdk/debs/`, or — as a last resort — from a clone of the
+   [doppler](https://github.com/pexip/doppler) repository. Only packages
+   matching the machine's architecture are installed.
 3. Build the `previs-client` binary from source.
 4. Install the binary to `/usr/local/bin/previs-client`.
 5. Copy `config.yaml` to `/etc/previs-client/config.yaml`.
@@ -205,11 +226,13 @@ PulseAudio devices.
 If you prefer to build step by step:
 
 ```bash
-# 1. Install the Pulse SDK (from the doppler repository)
-git clone --depth 1 https://github.com/pexip/doppler.git /tmp/doppler
-sudo dpkg -i /tmp/doppler/sdk/linux/debs/libpexcommon_*.deb \
-             /tmp/doppler/sdk/linux/debs/libpexpulse_*.deb   \
-             /tmp/doppler/sdk/linux/debs/libpexpulse-dev_*.deb
+# 1. Install the Pulse SDK (DEBS = the directory holding the .deb packages;
+#    on amd64 you can clone https://github.com/pexip/doppler.git and use
+#    /tmp/doppler/sdk/linux/debs, on arm64 use your own packages)
+DEBS=/home/previs/pulse-debs
+sudo dpkg -i "$DEBS"/libpexcommon_*.deb \
+             "$DEBS"/libpexpulse_*.deb   \
+             "$DEBS"/libpexpulse-dev_*.deb
 sudo apt-get install -f
 
 # 2. Install build dependencies
@@ -234,6 +257,8 @@ previs_raspberry_client/
 ├── CMakeLists.txt               CMake build definition
 ├── src/
 │   └── main.cpp                 Application source (C++17)
+├── sdk/
+│   └── debs/                    Drop Pulse SDK .deb packages here (git-ignored)
 ├── systemd/
 │   └── previs-client.service    systemd unit file
 └── scripts/
@@ -252,4 +277,5 @@ previs_raspberry_client/
 | Cannot reach server | `ping <server>` — check network and firewall rules (Pexip uses TCP 443 and UDP 3478/3479) |
 | Wrong PIN | Edit `/etc/previs-client/config.yaml` and restart the service |
 | `dpkg-dev : Depends: bzip2 but it is not installable` during install | The image has an incomplete apt configuration (the `-updates` pocket and/or the `universe` component is missing). The installer now enables them automatically; if it still fails, check `/etc/apt/sources.list` and `/etc/apt/sources.list.d/`, then run `sudo apt-get update && sudo apt-get -f install` |
-| SDK packages not found | Check that `sdk/linux/debs/*.deb` exist in the doppler repository clone |
+| SDK packages not found | Check that the `.deb` files exist in `PULSE_DEB_DIR` / `sdk/debs/` and are named `<package>_<version>_<arch>.deb` |
+| `package architecture (amd64) does not match system (arm64)` | The doppler repository only ships amd64 packages. Get arm64 packages from Pexip and run `sudo PULSE_DEB_DIR=/path/to/debs bash scripts/install.sh` |
