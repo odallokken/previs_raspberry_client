@@ -1,0 +1,49 @@
+[Unit]
+Description=PipeWire multimedia service for previs-client
+Documentation=https://github.com/odallokken/previs_raspberry_client
+# The Pexip Pulse SDK builds its audio pipeline out of GStreamer elements that
+# talk to PipeWire directly ('pipewiresrc' for the microphone, 'pipewiresink'
+# for the speaker).  Creating one of those elements calls pw_context_connect(),
+# which kills the client with SIGSEGV when there is no daemon to connect to:
+#
+#     pw_context_connect                     (libpipewire-0.3.so.0)
+#     gst_element_factory_make_valist        (libpexlgpl.so)
+#     pmx_device_session_add_audio_input     (libpexpulse.so)
+#     pulse_device_session_connect_device_by_id
+#
+# previs-client runs as a headless system user with no login session, so no
+# per-user PipeWire daemon is started for it — this unit provides one.
+After=sound.target
+Before=previs-wireplumber.service previs-pipewire-pulse.service previs-client.service
+
+[Service]
+Type=simple
+User=previs
+Group=previs
+UMask=0077
+
+# The socket (/run/previs-client/pipewire-0) lives in the runtime directory all
+# previs units share, so they must agree on it.  'RuntimeDirectoryPreserve'
+# keeps it alive across restarts of any single unit.
+RuntimeDirectory=previs-client
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+Environment="XDG_RUNTIME_DIR=/run/previs-client"
+
+# PipeWire and WirePlumber want a home directory for their configuration and
+# state; the 'previs' system user has none, so give it a private one.
+StateDirectory=previs-client
+Environment="HOME=/var/lib/previs-client"
+Environment="XDG_CONFIG_HOME=/var/lib/previs-client/.config"
+Environment="XDG_STATE_HOME=/var/lib/previs-client/.local/state"
+
+ExecStart=/usr/bin/pipewire
+
+Restart=always
+RestartSec=2s
+
+# Access to the sound and video devices.
+SupplementaryGroups=audio video render
+
+[Install]
+WantedBy=multi-user.target

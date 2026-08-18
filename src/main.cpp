@@ -202,7 +202,7 @@ static std::string pulse_socket_path()
 // The Pulse SDK opens its audio backend while the instance is being created,
 // so the sound server has to be up first: without it the SDK falls back to raw
 // ALSA, floods the journal with "Failed to connect"/"Got no caps from device"
-// and can die with SIGSEGV.  systemd orders us after previs-pulseaudio.service,
+// and can die with SIGSEGV.  systemd orders us after previs-pipewire-pulse.service,
 // but wait here too so a manually started client behaves the same.
 static bool wait_for_sound_server(const AppState & app, int timeout_seconds = 30)
 {
@@ -232,7 +232,7 @@ static bool wait_for_sound_server(const AppState & app, int timeout_seconds = 30
 
     std::fprintf(stderr,
                  "[client] No sound server at %s after %ds.\n"
-                 "[client] Check it with:  systemctl status previs-pulseaudio\n",
+                 "[client] Check it with:  systemctl status previs-pipewire-pulse\n",
                  path.c_str(), timeout_seconds);
     return false;
 }
@@ -262,6 +262,12 @@ static bool file_exists(const std::string & path)
     return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
+static bool socket_exists(const std::string & path)
+{
+    struct stat st{};
+    return stat(path.c_str(), &st) == 0 && S_ISSOCK(st.st_mode);
+}
+
 static bool ensure_pipewire_config()
 {
     std::vector<std::string> candidates;
@@ -269,11 +275,14 @@ static bool ensure_pipewire_config()
     const char * env = std::getenv("PIPEWIRE_CONFIG_DIR");
     if (env && env[0]) candidates.emplace_back(env);
 
+    // A real PipeWire installation always wins: its client.conf matches the
+    // installed modules, while the bundled copy below is only a fallback for
+    // machines where libpipewire-0.3-common could not be installed.
+    candidates.emplace_back("/usr/share/pipewire");
+    candidates.emplace_back("/etc/pipewire");
     candidates.emplace_back("/usr/local/share/previs-client/pipewire");
     candidates.emplace_back("/usr/share/previs-client/pipewire");
     candidates.emplace_back("/etc/previs-client/pipewire");
-    candidates.emplace_back("/usr/share/pipewire");
-    candidates.emplace_back("/etc/pipewire");
 
     for (const auto & dir : candidates) {
         if (!file_exists(dir + "/client.conf")) continue;
@@ -301,6 +310,118 @@ static bool ensure_pipewire_config()
                  searched.c_str());
     return false;
 }
+
+// ---------------------------------------------------------------------------
+//  PipeWire runtime
+// ---------------------------------------------------------------------------
+
+// The Pulse SDK builds its audio pipeline out of GStreamer elements that talk
+// to PipeWire directly ('pipewiresrc' for the microphone, 'pipewiresink' for
+// the speaker).  Creating such an element calls pw_context_connect(), which
+// dereferences a NULL protocol and kills the process with SIGSEGV when either
+//
+//   * the PipeWire modules are missing — libpipewire-module-protocol-native.so
+//     lives in 'libpipewire-0.3-modules', only a *recommendation* of the
+//     runtime library the SDK depends on, so it is absent on a plain image; or
+//   * no PipeWire daemon is running, i.e. there is no socket to connect to.
+//
+// The core dump of the audio crash therefore looks like:
+//
+//     pw_context_connect  <- libpipewire-0.3.so.0
+//     gst_element_factory_make_valist
+//     pmx_device_session_add_audio_input
+//     pulse_device_session_connect_device_by_id
+//
+// Neither condition can be detected through the SDK, so check both here and
+// skip the audio devices when the runtime is unusable: a video-only call beats
+// a restart loop.
+
+// Directory holding libpipewire-module-*.so, or an empty string when the
+// modules are not installed.
+static std::string pipewire_module_dir()
+{
+    std::vector<std::string> candidates;
+
+    const char * env = std::getenv("PIPEWIRE_MODULE_DIR");
+    if (env && env[0]) candidates.emplace_back(env);
+
+    candidates.emplace_back("/usr/lib/aarch64-linux-gnu/pipewire-0.3");
+    candidates.emplace_back("/usr/lib/arm-linux-gnueabihf/pipewire-0.3");
+    candidates.emplace_back("/usr/lib/x86_64-linux-gnu/pipewire-0.3");
+    candidates.emplace_back("/usr/lib/pipewire-0.3");
+    candidates.emplace_back("/usr/local/lib/pipewire-0.3");
+
+    for (const auto & dir : candidates)
+        if (file_exists(dir + "/libpipewire-module-protocol-native.so"))
+            return dir;
+
+    return {};
+}
+
+// Where the PipeWire daemon's socket should be, according to the environment.
+static std::string pipewire_socket_path()
+{
+    std::string name = "pipewire-0";
+    const char * remote = std::getenv("PIPEWIRE_REMOTE");
+    if (remote && remote[0]) name = remote;
+    if (name[0] == '/') return name;
+
+    const char * dir = std::getenv("PIPEWIRE_RUNTIME_DIR");
+    if (!dir || !dir[0]) dir = std::getenv("XDG_RUNTIME_DIR");
+    if (!dir || !dir[0]) return {};
+
+    return std::string(dir) + "/" + name;
+}
+
+// True when a PipeWire daemon can actually be reached, i.e. when it is safe to
+// let the SDK attach audio devices.
+static bool ensure_pipewire_runtime(const AppState & app, int timeout_seconds = 30)
+{
+    const std::string module_dir = pipewire_module_dir();
+    if (module_dir.empty()) {
+        std::fprintf(stderr,
+                     "[client] PipeWire modules are not installed"
+                     " (libpipewire-module-protocol-native.so not found).\n"
+                     "[client] The Pulse SDK's audio elements crash without"
+                     " them, so audio will be skipped.\n"
+                     "[client] Install them with:  sudo apt-get install"
+                     " libpipewire-0.3-modules\n");
+        return false;
+    }
+    setenv("PIPEWIRE_MODULE_DIR", module_dir.c_str(), 1);
+
+    const std::string path = pipewire_socket_path();
+    if (path.empty()) {
+        std::fprintf(stderr,
+                     "[client] Neither PIPEWIRE_RUNTIME_DIR nor XDG_RUNTIME_DIR"
+                     " is set — cannot tell whether a PipeWire daemon is"
+                     " running, so audio will be skipped.\n");
+        return false;
+    }
+
+    for (int waited = 0; waited < timeout_seconds * 10; ++waited) {
+        if (socket_exists(path)) {
+            std::printf("[client] Using PipeWire daemon at %s\n", path.c_str());
+            std::fflush(stdout);
+            return true;
+        }
+        if (app.shutdown_requested.load()) return false;
+        if (waited == 0) {
+            std::printf("[client] Waiting for the PipeWire daemon at %s ...\n",
+                        path.c_str());
+            std::fflush(stdout);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    std::fprintf(stderr,
+                 "[client] No PipeWire daemon at %s after %ds — audio will be"
+                 " skipped.\n"
+                 "[client] Check it with:  systemctl status previs-pipewire\n",
+                 path.c_str(), timeout_seconds);
+    return false;
+}
+
 
 // ---------------------------------------------------------------------------
 //  Pulse helpers
@@ -445,7 +566,8 @@ static std::vector<DeviceInfo> rank_candidates(const std::vector<DeviceInfo> & d
     return candidates;
 }
 
-static void connect_default_devices(AppState & app, const Config & cfg)
+static void connect_default_devices(AppState & app, const Config & cfg,
+                                    bool audio_enabled)
 {
     struct Binding {
         const char *        name;
@@ -461,6 +583,18 @@ static void connect_default_devices(AppState & app, const Config & cfg)
 
     int audio_failures = 0;
     for (const auto & b : bindings) {
+        // Attaching an audio device builds a GStreamer pipeline around
+        // pipewiresrc/pipewiresink, which segfaults inside pw_context_connect()
+        // when the PipeWire runtime is unusable.  Skipping the device keeps the
+        // client alive and lets it join the call video-only.
+        if (b.type == PULSE_MEDIA_AUDIO && !audio_enabled) {
+            std::fprintf(stderr,
+                         "[client] Skipping %s — no usable PipeWire runtime"
+                         " (see the warning above).\n", b.name);
+            ++audio_failures;
+            continue;
+        }
+
         std::vector<DeviceInfo> devices;
         list_devices(app, b.name, b.type, b.direction, devices);
 
@@ -498,7 +632,7 @@ static void connect_default_devices(AppState & app, const Config & cfg)
 
     // The Pulse SDK talks to a PulseAudio server.  When the client runs as a
     // headless system user there is no automatically started daemon, so
-    // previs-pulseaudio.service must be running and PULSE_SERVER must point at
+    // previs-pipewire-pulse.service must be running and PULSE_SERVER must point at
     // its socket — otherwise the SDK logs "Failed to connect: Connection
     // refused" and falls back to raw ALSA, which normally cannot open the
     // devices either.
@@ -508,7 +642,7 @@ static void connect_default_devices(AppState & app, const Config & cfg)
                      "[client] Continuing without some audio devices"
                      " (PULSE_SERVER=%s).\n"
                      "[client] Check that the sound server is running:\n"
-                     "[client]   systemctl status previs-pulseaudio\n",
+                     "[client]   systemctl status previs-pipewire-pulse\n",
                      server ? server : "<unset>");
     }
 }
@@ -605,7 +739,8 @@ int main(int argc, char * argv[])
     // Must happen before pulse_new(): the SDK initialises its audio backend
     // while creating the instance.
     wait_for_sound_server(app);
-    const bool have_pipewire_config = ensure_pipewire_config();
+    const bool have_pipewire_config  = ensure_pipewire_config();
+    const bool have_pipewire_runtime = ensure_pipewire_runtime(app);
 
     // Create and configure the Pulse instance.
     app.pulse = pulse_new();
@@ -616,7 +751,7 @@ int main(int argc, char * argv[])
 
     install_callbacks(app);
     if (have_pipewire_config) {
-        connect_default_devices(app, cfg);
+        connect_default_devices(app, cfg, have_pipewire_runtime);
     } else {
         std::fprintf(stderr,
                      "[client] Skipping device setup — see the PipeWire"

@@ -1,12 +1,14 @@
 [Unit]
 Description=Previs Pexip Video Client
 Documentation=https://github.com/odallokken/previs_raspberry_client
-After=network-online.target sound.target previs-pulseaudio.service
+After=network-online.target sound.target previs-pipewire.service previs-wireplumber.service previs-pipewire-pulse.service
 Wants=network-online.target
-# The Pulse SDK is unusable (and has been seen to crash) without a sound
-# server, so the client is only started once previs-pulseaudio is up.  'Type=
-# notify' on that unit means "up" really does mean "accepting connections".
-Requires=previs-pulseaudio.service
+# The Pulse SDK is unusable without a sound server, and its audio elements
+# crash with SIGSEGV inside pw_context_connect() when no PipeWire daemon is
+# running, so the client is only started once the whole PipeWire stack is up.
+# previs-client additionally waits for both sockets itself before touching any
+# device, so a manually started client behaves the same.
+Requires=previs-pipewire.service previs-wireplumber.service previs-pipewire-pulse.service
 
 [Service]
 Type=simple
@@ -20,11 +22,13 @@ Environment="PEX_BASE_PATH=/opt/pexninja"
 Environment="LD_LIBRARY_PATH=/opt/pexninja/lib"
 
 # The client runs as a headless system user with no login session, so there is
-# no automatically started PulseAudio daemon and no XDG_RUNTIME_DIR.  Point the
-# Pulse SDK at the daemon started by previs-pulseaudio.service, which runs as
-# the same user and puts its socket in this runtime directory; without this the
-# SDK logs "Failed to connect: Connection refused" and falls back to raw ALSA,
-# which then fails to open the capture/playback devices.
+# no automatically started sound server and no XDG_RUNTIME_DIR.  Point the Pulse
+# SDK at the pipewire-pulse daemon started by previs-pipewire-pulse.service,
+# which runs as the same user and puts its socket in this runtime directory;
+# without this the SDK logs "Failed to connect: Connection refused" and falls
+# back to raw ALSA, which then fails to open the capture/playback devices.
+# The PipeWire socket the SDK's GStreamer elements use (pipewire-0) lives in the
+# same directory and is found through XDG_RUNTIME_DIR.
 Environment="XDG_RUNTIME_DIR=/run/previs-client"
 Environment="PULSE_RUNTIME_PATH=/run/previs-client/pulse"
 Environment="PULSE_SERVER=unix:/run/previs-client/pulse/native"
@@ -32,8 +36,8 @@ RuntimeDirectory=previs-client
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes
 
-# Same private home directory as the sound server, so the two agree on where
-# PulseAudio's client configuration lives.
+# Same private home directory as the sound server, so the units agree on where
+# the PipeWire/PulseAudio client configuration lives.
 StateDirectory=previs-client
 Environment="HOME=/var/lib/previs-client"
 Environment="XDG_CONFIG_HOME=/var/lib/previs-client/.config"
@@ -45,8 +49,8 @@ Environment="XDG_CONFIG_HOME=/var/lib/previs-client/.config"
 #
 # and then dereferences the context it failed to create, which crashes the
 # client with SIGSEGV.  previs-client therefore looks for a directory that
-# really contains client.conf (the bundled fallback in
-# /usr/local/share/previs-client/pipewire, then /usr/share/pipewire) and exports
+# really contains client.conf (/usr/share/pipewire first, then the bundled
+# fallback in /usr/local/share/previs-client/pipewire) and exports
 # PIPEWIRE_CONFIG_DIR itself before initialising the SDK.  Set the variable here
 # only if you want to override that search with your own directory.
 
