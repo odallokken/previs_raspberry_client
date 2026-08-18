@@ -43,6 +43,9 @@ DOPPLER_DIR="/tmp/doppler-sdk"
 # The doppler repository checks the Pulse headers straight into the tree.  The
 # runtime-only 'pexninja' package ships no headers, so they are taken from here.
 DOPPLER_INCLUDE_SUBDIR="sdk/linux/opt/pexip/include"
+# Source for the Arm Performance Libraries replacement (see
+# ensure_armpl_runtime below).
+ARMPL_COMPAT_SRC="${REPO_DIR}/sdk/compat/armpl_compat.c"
 DOWNLOAD_DIR="/tmp/pulse-sdk-debs"
 BUILD_DIR="/tmp/previs-client-build"
 INSTALL_PREFIX="/usr/local"
@@ -200,6 +203,77 @@ ensure_sdk_headers() {
     info "Pulse headers installed to ${prefix}/include"
 }
 
+# Make sure the Arm Performance Libraries the arm64 SDK was built against are
+# available.
+#
+# The arm64 Pulse SDK is compiled with the Arm Compiler for Linux, so its
+# libraries carry 'NEEDED libamath.so' / 'NEEDED libastring.so' and reference
+# symbols such as 'armpl_vsinq_f32'.  Those libraries ship with the Arm
+# Performance Libraries, not with the pexninja package and not with Ubuntu, so
+# without them the build fails with:
+#
+#     libamath.so, needed by .../libpexpulse.so, not found
+#     undefined reference to `armpl_vsinq_f32'
+#
+# When the real libraries are not installed, build drop-in replacements from
+# sdk/compat/armpl_compat.c (plain libm math, lane by lane) next to the SDK
+# runtime.  Nothing happens on machines where the SDK needs neither library
+# (the amd64 build does not).
+ensure_armpl_runtime() {
+    local prefix="$1"
+    local libdir="${prefix}/lib"
+    local needed lib found=0
+
+    command -v readelf > /dev/null || return 0
+
+    needed="$(readelf -d "${libdir}"/*.so* 2>/dev/null \
+              | sed -nE 's/.*\(NEEDED\).*\[(lib(amath|astring)\.so)\].*/\1/p' \
+              | sort -u)"
+    [[ -n "${needed}" ]] || return 0
+
+    for lib in ${needed}; do
+        if [[ -e "${libdir}/${lib}" ]] || ldconfig -p 2>/dev/null | grep -q "[[:space:]]${lib}[[:space:]]"; then
+            continue
+        fi
+        found=1
+    done
+    (( found )) || return 0
+
+    if [[ "$(uname -m)" != "aarch64" ]]; then
+        error "The installed Pulse SDK needs the Arm Performance Libraries" \
+              "(${needed//$'\n'/ }) but this machine is not aarch64." \
+              "Install the Arm Performance Libraries and re-run the installer."
+    fi
+
+    [[ -f "${ARMPL_COMPAT_SRC}" ]] \
+        || error "Missing ${ARMPL_COMPAT_SRC} — needed to satisfy the Arm" \
+                 "Performance Libraries the Pulse SDK was built against."
+
+    info "The Pulse SDK needs the Arm Performance Libraries — building compatibility shims..."
+
+    for lib in ${needed}; do
+        [[ -e "${libdir}/${lib}" ]] && continue
+        case "${lib}" in
+            libamath.so)
+                gcc -shared -fPIC -O2 -Wl,-soname,libamath.so \
+                    -o "${libdir}/libamath.so" "${ARMPL_COMPAT_SRC}" -lm \
+                    || error "Failed to build ${libdir}/libamath.so"
+                ;;
+            libastring.so)
+                # The real libastring only replaces plain C string/memory
+                # routines, which glibc already provides — an empty library is
+                # enough to satisfy the NEEDED entry.
+                echo 'static int previs_libastring_placeholder;' \
+                    | gcc -shared -fPIC -O2 -x c - -Wl,-soname,libastring.so \
+                          -o "${libdir}/libastring.so" \
+                    || error "Failed to build ${libdir}/libastring.so"
+                ;;
+        esac
+        chmod 644 "${libdir}/${lib}"
+        info "Installed ${libdir}/${lib}"
+    done
+}
+
 # Download the Pulse SDK packages listed in sdk/pulse-sdk.conf for this
 # machine's architecture.  Returns non-zero (without aborting) when no download
 # is configured, so the caller can fall back to another source.
@@ -353,6 +427,9 @@ fi
 # The runtime-only 'pexninja' package carries no headers; supply them.
 ensure_sdk_headers "${SDK_PREFIX}"
 rm -rf "${DOPPLER_DIR}"
+
+# The arm64 SDK is linked against the Arm Performance Libraries; supply them.
+ensure_armpl_runtime "${SDK_PREFIX}"
 
 # ---------------------------------------------------------------------------
 # 3. Build

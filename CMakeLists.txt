@@ -62,11 +62,18 @@ target_link_libraries(previs-client PRIVATE
 find_package(Threads REQUIRED)
 
 # Set RPATH so the binary finds libpexpulse.so at runtime without needing
-# LD_LIBRARY_PATH.
+# LD_LIBRARY_PATH.  '--disable-new-dtags' emits DT_RPATH instead of DT_RUNPATH:
+# unlike RUNPATH, RPATH is also used when resolving the SDK's *own*
+# dependencies (libpexlgpl.so, libonnxruntime.so.1, libamath.so, ...), which
+# live in the same directory.  '-rpath-link' does the same at link time.
 set_target_properties(previs-client PROPERTIES
     BUILD_RPATH "${PEXIP_LIBRARY_DIR}"
     INSTALL_RPATH "${PEXIP_LIBRARY_DIR}"
     INSTALL_RPATH_USE_LINK_PATH ON)
+
+target_link_options(previs-client PRIVATE
+    "-Wl,--disable-new-dtags"
+    "-Wl,-rpath-link,${PEXIP_LIBRARY_DIR}")
 
 # ---------------------------------------------------------------------------
 # Install targets
