@@ -44,9 +44,11 @@ Environment="XDG_CONFIG_HOME=/var/lib/previs-client/.config"
 #     pw.conf: can't load config client.conf: No such file or directory
 #
 # and then dereferences the context it failed to create, which crashes the
-# client with SIGSEGV.  Point it at the system-wide configuration installed by
-# the PipeWire packages (scripts/install.sh makes sure they are present).
-Environment="PIPEWIRE_CONFIG_DIR=/usr/share/pipewire"
+# client with SIGSEGV.  previs-client therefore looks for a directory that
+# really contains client.conf (the bundled fallback in
+# /usr/local/share/previs-client/pipewire, then /usr/share/pipewire) and exports
+# PIPEWIRE_CONFIG_DIR itself before initialising the SDK.  Set the variable here
+# only if you want to override that search with your own directory.
 
 ExecStart=/usr/local/bin/previs-client /etc/previs-client/config.yaml
 

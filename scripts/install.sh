@@ -491,10 +491,20 @@ fi
 # so make sure it is installed.
 if [[ ! -f /usr/share/pipewire/client.conf ]]; then
     info "Installing PipeWire configuration needed by the Pulse SDK..."
-    apt-get install -y libpipewire-0.3-common \
-        || warning "Could not install libpipewire-0.3-common — the Pulse SDK may" \
-                   "log 'pw.conf: can't load config client.conf'."
+    apt-get install -y libpipewire-0.3-common || true
 fi
+
+# Even after the package install the file can still be missing (no network, the
+# package not in the archive, ...).  Ship a minimal client.conf of our own so
+# the SDK always has one; previs-client looks here before /usr/share/pipewire.
+if [[ ! -f /usr/share/pipewire/client.conf ]]; then
+    warning "libpipewire-0.3-common is not available — installing the bundled" \
+            "PipeWire client configuration instead."
+fi
+info "Installing PipeWire fallback configuration for previs-client..."
+install -d -m 755 "${INSTALL_PREFIX}/share/previs-client/pipewire"
+install -m 644 "${REPO_DIR}/sdk/pipewire/client.conf" \
+    "${INSTALL_PREFIX}/share/previs-client/pipewire/client.conf"
 
 # ---------------------------------------------------------------------------
 # 5. System user
