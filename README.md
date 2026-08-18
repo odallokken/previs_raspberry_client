@@ -247,6 +247,29 @@ packages matching the machine's architecture (`arm64` on a Raspberry Pi,
 | 3 | The URL configured in `sdk/pulse-sdk.conf` | **The normal customer path** — downloaded automatically |
 | 4 | A clone of [pexip/doppler](https://github.com/pexip/doppler) | Fallback; upstream publishes **amd64 only** |
 
+### Headers: the runtime package has none
+
+The current `pexninja` package is **runtime only** — it installs
+`libpexpulse.so` and its private siblings under `/opt/pexninja/lib` and nothing
+else. There is no `pexninja-dev` companion, so `pexpulse/pulse.h` is missing and
+the client cannot be compiled against the package alone.
+
+The installer solves this by copying the headers out of the public
+[pexip/doppler](https://github.com/pexip/doppler) repository, which checks them
+into the tree at `sdk/linux/opt/pexip/include/pexpulse/` (~400 KB), and
+installing them next to the runtime at `<prefix>/include`. This happens
+automatically; no action is needed.
+
+Pulse exposes a plain C API (`extern "C"`, no C++ name mangling or class
+layouts), so a version difference between the doppler headers and the installed
+runtime is tolerated. If a build ever fails with an undefined `pulse_*` symbol
+at link time, the headers are newer than the runtime — check which symbols the
+runtime actually exports:
+
+```bash
+nm -D --defined-only /opt/pexninja/lib/libpexpulse.so | grep ' pulse_'
+```
+
 For customers this should be invisible: clone the repository and run the
 installer. That only works once the maintainer has published the packages, as
 described next.
@@ -326,6 +349,8 @@ previs_raspberry_client/
 | Wrong PIN | Edit `/etc/previs-client/config.yaml` and restart the service |
 | `dpkg-dev : Depends: bzip2 but it is not installable` during install | The image has an incomplete apt configuration (the `-updates` pocket and/or the `universe` component is missing). The installer now enables them automatically; if it still fails, check `/etc/apt/sources.list` and `/etc/apt/sources.list.d/`, then run `sudo apt-get update && sudo apt-get -f install` |
 | SDK packages not found | Check that the `.deb` files exist in `PULSE_DEB_DIR` / `sdk/debs/` and are named `<package>_<version>_<arch>.deb` (for example `pexninja_1.0.18250...ubuntu2404_arm64.deb`) |
+| `fatal error: pexpulse/pulse.h: No such file` | The runtime package ships no headers and the installer could not reach github.com to fetch them from the doppler repository — see [Headers: the runtime package has none](#headers-the-runtime-package-has-none) |
+| Link errors mentioning `pa_*` or `pw_*` symbols | The Pulse runtime's own dependencies (`libpulse0`, `libpipewire-0.3-0`, `libasound2`, `libX11`, ...) are missing. Run `sudo apt-get install -f` to let the SDK package pull them in |
 | `package architecture (amd64) does not match system (arm64)` | The public doppler repository only ships amd64 packages. An arm64 SDK release must be configured in `sdk/pulse-sdk.conf` — see [Where the Pulse SDK comes from](#where-the-pulse-sdk-comes-from) |
 | `Failed to download ...` during install | Check the URL in `sdk/pulse-sdk.conf` is reachable from the Pi (`curl -I <url>`) and that any proxy is configured |
 | `Checksum mismatch for ...` | The published package changed or the download was truncated. Re-run the installer; if it persists, update the checksums in `sdk/pulse-sdk.conf` |

@@ -6,7 +6,9 @@
 //  When the call drops it waits reconnect_delay_seconds then dials again.
 //
 //  Build requirements (Ubuntu 24.04 / Ubuntu 22.04 on ARM64):
-//    - Pexip Pulse SDK (.deb packages from the doppler repository)
+//    - Pexip Pulse SDK runtime (the 'pexninja' .deb) plus the pexpulse headers,
+//      which scripts/install.sh takes from the public doppler repository
+//      because the runtime package ships none
 //    - libyaml-cpp-dev
 //    - libglfw3-dev, libgl1-mesa-dev  (Pulse needs OpenGL headers at link time)
 //
@@ -170,9 +172,12 @@ static void install_callbacks(AppState & app)
     pulse_options_set_conference_state_callback(app.pulse, &conf_cb);
     pulse_options_set_application_user_agent_string(app.pulse, "previs-client/1.0");
 
-    // Headless: disable Pulse's auto-spawned video windows.
-    pulse_options_set_main_window_handle(app.pulse, nullptr);
-    pulse_options_set_selfview_window_handle(app.pulse, nullptr);
+    // Headless: disable Pulse's auto-spawned video windows.  Each of these must
+    // be set to NULL before connecting, or Pulse spawns its own window.
+    pulse_options_set_self_view_window_handle(app.pulse, nullptr);
+    pulse_options_set_remote_video_window_handle(app.pulse, nullptr);
+    pulse_options_set_presentation_video_window_handle(app.pulse, nullptr);
+    pulse_options_set_preflight_video_window_handle(app.pulse, nullptr);
 }
 
 static void connect_default_devices(AppState & app)

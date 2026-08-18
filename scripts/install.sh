@@ -40,6 +40,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 DOPPLER_REPO="https://github.com/pexip/doppler.git"
 DOPPLER_DIR="/tmp/doppler-sdk"
+# The doppler repository checks the Pulse headers straight into the tree.  The
+# runtime-only 'pexninja' package ships no headers, so they are taken from here.
+DOPPLER_INCLUDE_SUBDIR="sdk/linux/opt/pexip/include"
 DOWNLOAD_DIR="/tmp/pulse-sdk-debs"
 BUILD_DIR="/tmp/previs-client-build"
 INSTALL_PREFIX="/usr/local"
@@ -146,15 +149,55 @@ fi
 # ---------------------------------------------------------------------------
 
 # Print the first known prefix that holds an installed Pulse SDK, or return 1.
+# A prefix counts as an install when it has either the headers or the runtime
+# library: the current 'pexninja' package ships the library only.
 detect_sdk_prefix() {
     local prefix
     for prefix in "${SDK_PREFIXES[@]}"; do
-        if [[ -f "${prefix}/include/pexpulse/pulse.h" ]]; then
+        if [[ -f "${prefix}/include/pexpulse/pulse.h" ]] \
+           || compgen -G "${prefix}/lib/libpexpulse.so*" > /dev/null; then
             printf '%s\n' "${prefix}"
             return 0
         fi
     done
     return 1
+}
+
+# Shallow-clone the public doppler repository into DOPPLER_DIR (once).
+clone_doppler() {
+    [[ -d "${DOPPLER_DIR}/.git" ]] && return 0
+    rm -rf "${DOPPLER_DIR}"
+    git clone --depth 1 "${DOPPLER_REPO}" "${DOPPLER_DIR}"
+}
+
+# Make sure <prefix>/include/pexpulse/pulse.h exists.
+#
+# The Pulse SDK used to ship a libpexpulse-dev package with the headers.  The
+# current 'pexninja' package is runtime only, and Pexip publishes no -dev
+# companion for it, so the headers are taken from the public doppler
+# repository, which checks them into the tree.  They describe a plain C API, so
+# a small version skew against the installed runtime is expected and harmless.
+ensure_sdk_headers() {
+    local prefix="$1"
+    [[ -f "${prefix}/include/pexpulse/pulse.h" ]] && return 0
+
+    info "The installed Pulse SDK ships no headers — fetching them from the doppler repository..."
+    clone_doppler || error "Failed to clone ${DOPPLER_REPO}.  The Pulse headers" \
+                           "are needed to build the client; check this machine's" \
+                           "network/proxy settings."
+
+    local src="${DOPPLER_DIR}/${DOPPLER_INCLUDE_SUBDIR}"
+    [[ -d "${src}" ]] || error "Could not find ${DOPPLER_INCLUDE_SUBDIR} in the" \
+                               "doppler repository.  Check that the repo structure" \
+                               "matches what is expected."
+
+    mkdir -p "${prefix}/include"
+    cp -a "${src}/." "${prefix}/include/"
+
+    [[ -f "${prefix}/include/pexpulse/pulse.h" ]] \
+        || error "Copying the Pulse headers to ${prefix}/include failed."
+
+    info "Pulse headers installed to ${prefix}/include"
 }
 
 # Download the Pulse SDK packages listed in sdk/pulse-sdk.conf for this
@@ -241,8 +284,8 @@ else
         SDK_DEBS="${DOWNLOAD_DIR}"
     else
         info "Cloning doppler repository to get the Pulse SDK..."
-        rm -rf "${DOPPLER_DIR}"
-        git clone --depth 1 "${DOPPLER_REPO}" "${DOPPLER_DIR}"
+        clone_doppler || error "Failed to clone ${DOPPLER_REPO} — check this" \
+                               "machine's network/proxy settings."
 
         SDK_DEBS="${DOPPLER_DIR}/sdk/linux/debs"
         if [[ ! -d "${SDK_DEBS}" ]]; then
@@ -298,14 +341,18 @@ else
     apt-get install -f -y   # resolve any missing dependencies
 
     if ! SDK_PREFIX="$(detect_sdk_prefix)"; then
-        error "The Pulse SDK packages did not install correctly —" \
-              "include/pexpulse/pulse.h was not found under" \
+        error "The Pulse SDK packages did not install correctly — neither" \
+              "include/pexpulse/pulse.h nor lib/libpexpulse.so was found under" \
               "${SDK_PREFIXES[*]}.  Check the dpkg output above for errors."
     fi
 
-    rm -rf "${DOPPLER_DIR}" "${DOWNLOAD_DIR}"
+    rm -rf "${DOWNLOAD_DIR}"
     info "Pulse SDK installed."
 fi
+
+# The runtime-only 'pexninja' package carries no headers; supply them.
+ensure_sdk_headers "${SDK_PREFIX}"
+rm -rf "${DOPPLER_DIR}"
 
 # ---------------------------------------------------------------------------
 # 3. Build
