@@ -239,11 +239,18 @@ sudo apt-get install -f
 sudo apt-get install -y cmake build-essential libyaml-cpp-dev \
                         libglfw3-dev libgl1-mesa-dev
 
-# 3. Build
+# 3. On arm64 only: supply the Arm Performance Libraries the SDK was built
+#    against (skip if libamath.so / libastring.so are already installed).
+sudo gcc -shared -fPIC -O2 -Wl,-soname,libamath.so \
+     -o /opt/pexninja/lib/libamath.so sdk/compat/armpl_compat.c -lm
+echo '' | sudo gcc -shared -fPIC -x c - -Wl,-soname,libastring.so \
+     -o /opt/pexninja/lib/libastring.so
+
+# 4. Build
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 
-# 4. Run with a local config
+# 5. Run with a local config
 PEX_BASE_PATH=/opt/pexninja ./build/previs-client config.yaml
 ```
 
@@ -286,6 +293,27 @@ runtime actually exports:
 ```bash
 nm -D --defined-only /opt/pexninja/lib/libpexpulse.so | grep ' pulse_'
 ```
+
+### arm64: the SDK needs the Arm Performance Libraries
+
+The arm64 build of the SDK is compiled with the Arm Compiler for Linux, so its
+libraries record `NEEDED libamath.so` / `NEEDED libastring.so` and reference
+symbols such as `armpl_vsinq_f32`. Those come from the Arm Performance
+Libraries, which are shipped neither with the `pexninja` package nor with
+Ubuntu, so a plain build fails with:
+
+```
+/usr/bin/ld: warning: libamath.so, needed by /opt/pexninja/lib/libpexpulse.so, not found
+/usr/bin/ld: /opt/pexninja/lib/libpexpulse.so: undefined reference to `armpl_vsinq_f32'
+```
+
+The installer handles this automatically: if neither library is present it
+compiles `sdk/compat/armpl_compat.c` into `<prefix>/lib/libamath.so` — the same
+vector math entry points implemented lane by lane on top of the standard C
+math library — together with an empty `libastring.so` (the real one only
+replaces plain C string routines that glibc already provides). If the genuine
+Arm Performance Libraries are installed, they are used instead and nothing is
+built.
 
 For customers this should be invisible: clone the repository and run the
 installer. That only works once the maintainer has published the packages, as
@@ -346,6 +374,8 @@ previs_raspberry_client/
 │   └── main.cpp                 Application source (C++17)
 ├── sdk/
 │   ├── pulse-sdk.conf           Where the installer downloads the Pulse SDK from
+│   ├── compat/
+│   │   └── armpl_compat.c       Arm Performance Libraries replacement (arm64)
 │   └── debs/                    Optional local Pulse SDK .deb packages (git-ignored)
 ├── systemd/
 │   └── previs-client.service    systemd unit file
@@ -366,6 +396,7 @@ previs_raspberry_client/
 | Wrong PIN | Edit `/etc/previs-client/config.yaml` and restart the service |
 | `dpkg-dev : Depends: bzip2 but it is not installable` during install | The image has an incomplete apt configuration (the `-updates` pocket and/or the `universe` component is missing). The installer now enables them automatically; if it still fails, check `/etc/apt/sources.list` and `/etc/apt/sources.list.d/`, then run `sudo apt-get update && sudo apt-get -f install` |
 | SDK packages not found | Check that the `.deb` files exist in `PULSE_DEB_DIR` / `sdk/debs/` and are named `<package>_<version>_<arch>.deb` (for example `pexninja_1.0.18250...ubuntu2404_arm64.deb`) |
+| `undefined reference to armpl_...` / `libamath.so ... not found` | The arm64 SDK needs the Arm Performance Libraries. Re-run `sudo bash scripts/install.sh`, which builds replacements into the SDK's `lib/` directory — see [arm64: the SDK needs the Arm Performance Libraries](#arm64-the-sdk-needs-the-arm-performance-libraries) |
 | `fatal error: pexpulse/pulse.h: No such file` | The runtime package ships no headers and the installer could not reach github.com to fetch them from the doppler repository — see [Headers: the runtime package has none](#headers-the-runtime-package-has-none) |
 | Link errors mentioning `pa_*` or `pw_*` symbols | The Pulse runtime's own dependencies (`libpulse0`, `libpipewire-0.3-0`, `libasound2`, `libX11`, ...) are missing. Run `sudo apt-get install -f` to let the SDK package pull them in |
 | `package architecture (amd64) does not match system (arm64)` | The public doppler repository only ships amd64 packages. An arm64 SDK release must be configured in `sdk/pulse-sdk.conf` — see [Where the Pulse SDK comes from](#where-the-pulse-sdk-comes-from) |
